@@ -254,6 +254,9 @@ impl Runtime {
             obj.insert("sola_ncc".into(), json!(s.sola_ncc.load()));
             obj.insert("blocks_sent".into(), json!(s.blocks_sent.load(Ordering::Relaxed)));
             obj.insert("ring_full".into(), json!(s.ring_full.load(Ordering::Relaxed)));
+            obj.insert("captured".into(), json!(s.captured.load(Ordering::Relaxed)));
+            obj.insert("rendered".into(), json!(s.rendered.load(Ordering::Relaxed)));
+            obj.insert("blocks_received".into(), json!(s.blocks_received.load(Ordering::Relaxed)));
             if let Some(p) = &sess.pipeline {
                 obj.insert("devices".into(), serde_json::to_value(&p.info).unwrap_or(Value::Null));
             }

@@ -60,6 +60,8 @@ pub struct Shared {
     pub blocks_sent: AtomicU64,
     pub blocks_received: AtomicU64,
     pub ring_full: AtomicU64,
+    pub captured: AtomicU64,
+    pub rendered: AtomicU64,
     pub fifo_samples: AtomicUsize,
     pub engine_live: AtomicBool,
     pub down_mode: AtomicU8,
@@ -80,6 +82,8 @@ impl Default for Shared {
             blocks_sent: AtomicU64::new(0),
             blocks_received: AtomicU64::new(0),
             ring_full: AtomicU64::new(0),
+            captured: AtomicU64::new(0),
+            rendered: AtomicU64::new(0),
             fifo_samples: AtomicUsize::new(0),
             engine_live: AtomicBool::new(false),
             down_mode: AtomicU8::new(0),
@@ -180,6 +184,7 @@ pub struct CaptureSide {
 impl CaptureSide {
     pub fn process(&mut self, x: &[f32]) {
         self.meter.process(x, &self.shared.in_meter);
+        self.shared.captured.fetch_add(x.len() as u64, Ordering::Relaxed);
         push_slice(&mut self.dry, x);
         for chunk in x.chunks(CAPTURE_MAX_CHUNK) {
             let n = self.rs.process(chunk, &mut self.tmp);
@@ -204,25 +209,57 @@ impl CaptureSide {
     }
 }
 
-/// Device-thread side of rendering, with underrun concealment and drift control.
+/// Device-thread side of rendering: underrun concealment plus a latency controller.
+///
+/// Blocks arrive in bursts of one engine block, so the FIFO level saw-tooths between a floor
+/// and floor + block. The controller watches the floor (minimum level over a 1 s window); if it
+/// sits above the jitter target — after a start-up burst or from slow clock drift — the excess
+/// is skipped with a short crossfade, so latency never creeps up.
 pub struct RenderSide {
     fifo: rtrb::Consumer<f32>,
     starved: bool,
     fade_in: usize,
     last: f32,
     prefill: usize,
-    high_water: usize,
-    over: usize,
+    window_min: usize,
+    window_pos: usize,
+    scratch: Vec<f32>,
+    pending: [f32; FADE],
+    pending_len: usize,
+    pending_pos: usize,
     gain: Option<Arc<Shared>>, // monitor sides read monitor_gain
     shared: Arc<Shared>,
     count_underruns: bool,
 }
 
+const CONTROL_WINDOW: usize = RATE; // 1 s
+const CONTROL_SLACK: usize = 3 * RATE / 1000; // tolerate 3 ms above target
+
 impl RenderSide {
+    fn new(fifo: rtrb::Consumer<f32>, prefill: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
+        Self {
+            fifo,
+            starved: true,
+            fade_in: 0,
+            last: 0.0,
+            prefill: prefill.max(1),
+            window_min: usize::MAX,
+            window_pos: 0,
+            scratch: vec![0.0; RATE + FADE],
+            pending: [0.0; FADE],
+            pending_len: 0,
+            pending_pos: 0,
+            gain,
+            shared,
+            count_underruns,
+        }
+    }
+
     pub fn process(&mut self, out: &mut [f32]) {
         let avail = self.fifo.slots();
         if self.count_underruns {
             self.shared.fifo_samples.store(avail, Ordering::Relaxed);
+            self.shared.rendered.fetch_add(out.len() as u64, Ordering::Relaxed);
         }
         if self.starved {
             if avail < self.prefill {
@@ -231,22 +268,21 @@ impl RenderSide {
             }
             self.starved = false;
             self.fade_in = 0;
+            self.window_min = usize::MAX;
+            self.window_pos = 0;
         }
-        // Drift control: if the FIFO stays well above target (capture clock faster than render
-        // clock), drop the excess once and fade back in.
-        if avail > self.high_water {
-            self.over += out.len();
-            if self.over > RATE {
-                discard(&mut self.fifo, avail - self.prefill);
-                self.fade_in = 0;
-                self.over = 0;
-            }
-        } else {
-            self.over = 0;
+        self.control(avail, out.len());
+
+        // Crossfade remainder from a latency correction goes first.
+        let mut w = 0;
+        while self.pending_pos < self.pending_len && w < out.len() {
+            out[w] = self.pending[self.pending_pos];
+            self.pending_pos += 1;
+            w += 1;
         }
-        let n = pop_into(&mut self.fifo, out);
+        let n = w + pop_into(&mut self.fifo, &mut out[w..]);
         if n < out.len() {
-            // Underrun: conceal with a short decay from the last good sample, then wait for prefill.
+            // Underrun: conceal with a short decay from the last good sample, then re-prefill.
             if self.count_underruns {
                 self.shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
@@ -256,7 +292,7 @@ impl RenderSide {
             self.decay_last(&mut out[n..]);
             self.starved = true;
         }
-        for v in out[..n].iter_mut() {
+        for v in out[w..n].iter_mut() {
             if self.fade_in < FADE {
                 *v *= self.fade_in as f32 / FADE as f32;
                 self.fade_in += 1;
@@ -269,6 +305,36 @@ impl RenderSide {
         if n > 0 && !self.starved {
             self.last = out[n - 1];
         }
+    }
+
+    /// Track the FIFO floor; once per window, skip any persistent excess above the target.
+    fn control(&mut self, avail: usize, period: usize) {
+        self.window_min = self.window_min.min(avail);
+        self.window_pos += period;
+        if self.window_pos < CONTROL_WINDOW {
+            return;
+        }
+        let floor = self.window_min;
+        self.window_min = usize::MAX;
+        self.window_pos = 0;
+        if floor <= self.prefill + CONTROL_SLACK || self.pending_pos < self.pending_len {
+            return;
+        }
+        let excess = (floor - self.prefill).min(self.scratch.len() - FADE);
+        let need = excess + FADE;
+        if self.fifo.slots() < need {
+            return;
+        }
+        let got = pop_into(&mut self.fifo, &mut self.scratch[..need]);
+        debug_assert_eq!(got, need);
+        // Equal-gain crossfade from "where we were" to "where we skip to".
+        for i in 0..FADE {
+            let t = (i as f32 + 0.5) / FADE as f32;
+            let fi = (t * std::f32::consts::FRAC_PI_2).sin().powi(2);
+            self.pending[i] = self.scratch[i] * (1.0 - fi) + self.scratch[excess + i] * fi;
+        }
+        self.pending_len = FADE;
+        self.pending_pos = 0;
     }
 
     fn decay_last(&mut self, out: &mut [f32]) {
@@ -426,18 +492,8 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
     let (dry_p, dry_c) = rtrb::RingBuffer::new(fifo_cap / 2);
     let (tx, rx) = crossbeam_channel::unbounded();
     let jitter = (jitter_ms * RATE as f32 / 1000.0) as usize;
-    let block48 = layout.block_in * 3;
-    let render_side = |fifo, is_monitor: bool| RenderSide {
-        fifo,
-        starved: true,
-        fade_in: 0,
-        last: 0.0,
-        prefill: jitter.max(1),
-        high_water: jitter + 3 * block48,
-        over: 0,
-        gain: is_monitor.then(|| shared.clone()),
-        shared: shared.clone(),
-        count_underruns: !is_monitor,
+    let render_side = |fifo, is_monitor: bool| {
+        RenderSide::new(fifo, jitter, is_monitor.then(|| shared.clone()), shared.clone(), !is_monitor)
     };
     let render = render_side(out_c, false);
     let monitor = mon_c.map(|c| render_side(c, true));

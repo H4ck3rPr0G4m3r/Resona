@@ -13,11 +13,12 @@ use crate::{AudioError, Direction, Result, SAMPLE_RATE};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamMode {
-    /// Low-latency shared mode when possible, regular shared mode otherwise.
+    /// Regular event-driven shared mode (10 ms engine period). The safe default.
     #[default]
-    Auto,
-    /// Regular event-driven shared mode with format autoconversion (10 ms engine period).
     Shared,
+    /// IAudioClient3 low-latency shared mode when the driver supports it (falls back to Shared).
+    /// Opt-in: some virtual drivers (e.g. VAC Lite) run their clock wrong in this mode.
+    LowLatency,
     /// Exclusive mode at the device's minimum period.
     Exclusive,
 }
@@ -84,7 +85,7 @@ fn open(direction: Direction, cfg: &StreamConfig) -> Result<Opened> {
         return Ok(Opened { client, event, fmt, channels, info });
     }
 
-    if cfg.mode == StreamMode::Auto && mix.get_samplespersec() == SAMPLE_RATE {
+    if cfg.mode == StreamMode::LowLatency && mix.get_samplespersec() == SAMPLE_RATE {
         if let Some(fmt) = mix_fmt {
             let attempt = (|| -> Result<Opened> {
                 let mut client = device.get_iaudioclient()?;
