@@ -1,0 +1,83 @@
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from resona_engine.audio import load_mono
+from resona_engine.backends.base import LiveParams, StreamConfig
+from resona_engine.backends.rvc_v2 import FeatureStack, RVCv2Backend, Voice
+from resona_engine.harness import seam_summary
+from resona_engine.pipeline.offline import convert_offline, convert_streaming
+from tests.conftest import harmonic_tone, index_for, reference_models, requires_cuda, requires_models
+
+CLIPS = Path(__file__).parent / "clips"
+
+pytestmark = [requires_cuda, requires_models]
+
+
+@pytest.fixture(scope="module")
+def features(assets):
+    return FeatureStack(assets, torch.device("cuda"))
+
+
+@pytest.fixture(scope="module")
+def voice():
+    pth = next(p for p in reference_models() if index_for(p) and "Trump" in str(p))
+    return Voice.load(pth, index_for(pth), torch.device("cuda"))
+
+
+def test_streaming_block_shapes(features, voice):
+    be = RVCv2Backend(features, voice)
+    lay = be.configure(StreamConfig())
+    assert lay.block_in == 960 and lay.block_out == 60 * voice.info.sr // 1000
+    out = be.process(torch.zeros(lay.block_in), LiveParams())
+    assert out.shape == (lay.out_len,)
+
+
+def test_pipeline_silence_is_finite_and_quiet(features, voice):
+    be = RVCv2Backend(features, voice)
+    lay = be.configure(StreamConfig())
+    for _ in range(20):
+        out = be.process(torch.zeros(lay.block_in), LiveParams(pitch=12))
+    assert torch.isfinite(out).all()
+    assert out.abs().max() < 0.05
+    assert abs(float(out.mean())) < 1e-2  # no DC
+
+
+def test_no_index_path(features, voice):
+    x = harmonic_tone(150.0, 1.0).numpy()
+    no_index = Voice(voice.info, voice.synth, None)
+    a = convert_offline(features, no_index, x, LiveParams(index_rate=0.7))
+    b = convert_offline(features, voice, x, LiveParams(index_rate=0.0))
+    np.testing.assert_allclose(a, b, atol=2e-3)
+
+
+def test_wrong_block_size_rejected(features, voice):
+    be = RVCv2Backend(features, voice)
+    be.configure(StreamConfig())
+    with pytest.raises(ValueError):
+        be.process(torch.zeros(100), LiveParams())
+
+
+def test_invalid_stream_config():
+    with pytest.raises(ValueError):
+        StreamConfig(block_ms=50).validate()
+    with pytest.raises(ValueError):
+        StreamConfig(lookahead_ms=20, crossfade_ms=20).validate()
+
+
+@pytest.mark.parametrize("method", ["rmvpe", "fcpe"])
+def test_streaming_output_length_and_seams(features, voice, method):
+    x = load_mono(CLIPS / "speech.wav", 16000)[: 16000 * 3]
+    res = convert_streaming(features, voice, x, LiveParams(), StreamConfig(f0_method=method))
+    assert abs(len(res.audio) - len(x) * voice.info.sr / 16000) <= 1
+    assert np.isfinite(res.audio).all()
+    s = seam_summary(res.seams)
+    assert s["seam_ncc"] > 0.8, s  # regression guard (naive RVC streaming scores ~0.78)
+
+
+def test_formant_shift_runs(features, voice):
+    x = load_mono(CLIPS / "speech.wav", 16000)[:16000]
+    y = convert_offline(features, voice, x, LiveParams(formant=3.0))
+    assert np.isfinite(y).all() and np.abs(y).max() > 1e-3
