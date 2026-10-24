@@ -1,0 +1,11 @@
+[package]
+name = "resona-audio-io"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wasapi = { workspace = true }
+windows = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }

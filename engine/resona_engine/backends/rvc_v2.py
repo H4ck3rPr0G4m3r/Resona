@@ -151,6 +151,17 @@ class RVCv2Backend:
             self.voice.synth.reset()
 
     # -- streaming -------------------------------------------------------------------------
+    @torch.no_grad()
+    def skip(self, x16k: torch.Tensor) -> None:
+        """Advance the input timeline without inference (catch-up after a stall).
+
+        Continuity state is dropped, so the next processed block starts a fresh phase/pitch history.
+        """
+        self.buf = torch.cat([self.buf[self.B :], x16k.to(self.device, torch.float32)])
+        self.n_in += self.B
+        self.f0post.reset()
+        self.voice.synth.reset()
+
     def _sync(self):
         if self.profile and self.device.type == "cuda":
             torch.cuda.synchronize()

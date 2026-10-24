@@ -1,0 +1,8 @@
+[package]
+name = "resona-shm-ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+windows = { workspace = true }
+thiserror = { workspace = true }
