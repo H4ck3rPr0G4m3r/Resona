@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["host/shm-ipc", "host/audio-io", "host/dsp"]
+members = ["host/shm-ipc", "host/audio-io", "host/dsp", "host/runtime"]
 
 [workspace.package]
 version = "0.1.0"

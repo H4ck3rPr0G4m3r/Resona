@@ -1,0 +1,17 @@
+[package]
+name = "resona-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+resona-shm-ipc = { path = "../shm-ipc" }
+resona-audio-io = { path = "../audio-io" }
+resona-dsp = { path = "../dsp" }
+rtrb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+windows = { workspace = true }
