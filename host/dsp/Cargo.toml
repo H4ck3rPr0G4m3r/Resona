@@ -4,5 +4,4 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-rubato = { workspace = true }
 serde = { workspace = true }

@@ -280,7 +280,7 @@ is under 1.5 GB. Two or three voices can be preloaded on 8 GB alongside a game.
 - The engine returns `B + X` samples, where X is the crossfade length (default 10 ms).
 - The host searches for the best alignment offset within ±search (default 5 ms) using normalized
   cross-correlation between the previous tail and the new head.
-- It then applies an **equal-power** crossfade and stores the new tail.
+- It then applies an **equal-gain raised-cosine** crossfade (the aligned signals are correlated, so equal-power would add up to +3 dB at each seam) and stores the new tail.
 
 ### 5.4 Output chain (48 kHz)
 

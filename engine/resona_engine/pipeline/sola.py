@@ -9,8 +9,10 @@ class Sola:
     def __init__(self, crossfade: int, search: int):
         self.X, self.S = crossfade, search
         t = np.linspace(0.0, 1.0, crossfade, endpoint=False) + 0.5 / max(crossfade, 1)
-        self.fade_in = np.sin(0.5 * np.pi * t).astype(np.float32)  # equal power
-        self.fade_out = np.cos(0.5 * np.pi * t).astype(np.float32)
+        # Raised-cosine (equal-gain): the aligned signals are correlated, so equal-power would
+        # bump the level by up to +3 dB at each seam.
+        self.fade_in = (np.sin(0.5 * np.pi * t) ** 2).astype(np.float32)
+        self.fade_out = (1.0 - self.fade_in).astype(np.float32)
         self.tail: np.ndarray | None = None
         self.last_offset = search // 2
         self.seam_stats: list[tuple[float, float, float]] = []  # (ncc, mismatch_db, tail_rms)

@@ -48,6 +48,7 @@ struct Opened {
 }
 
 const HNS_PER_MS: i64 = 10_000;
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn open(direction: Direction, cfg: &StreamConfig) -> Result<Opened> {
     let device = open_device(direction, cfg.device_id.as_deref())?;
@@ -193,8 +194,17 @@ impl Running {
                 }
             })
             .map_err(|e| AudioError::Start(e.to_string()))?;
-        let info = rx.recv().map_err(|e| AudioError::Start(e.to_string()))??;
-        Ok(Self { stop, thread: Some(thread), info })
+        match rx.recv_timeout(OPEN_TIMEOUT) {
+            Ok(info) => Ok(Self { stop, thread: Some(thread), info: info? }),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A hung Initialize is almost always security software (e.g. antivirus microphone
+                // protection) holding the request. Detach the thread; if it ever opens, it sees
+                // `stop` and exits immediately.
+                stop.store(true, Ordering::Release);
+                Err(AudioError::Timeout(direction))
+            }
+            Err(e) => Err(AudioError::Start(e.to_string())),
+        }
     }
 
     fn stop(&mut self) {

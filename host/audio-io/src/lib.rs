@@ -42,6 +42,11 @@ pub enum AudioError {
     Format(String),
     #[error("stream thread failed to start: {0}")]
     Start(String),
+    #[error(
+        "{0:?} device did not open within 5 s — microphone/audio access may be blocked by security \
+         software (e.g. antivirus microphone protection); allow Resona and try again"
+    )]
+    Timeout(Direction),
 }
 
 pub type Result<T> = std::result::Result<T, AudioError>;
