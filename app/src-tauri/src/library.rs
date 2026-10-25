@@ -118,13 +118,14 @@ fn base_key(stem: &str) -> String {
 }
 
 /// Pick the index for `model` among `indexes` (same folder). RVC writes both `trained_*`
-/// (an empty IVF) and `added_*` (the real vectors); only the latter is useful.
-pub fn pair_index(model: &Path, indexes: &[PathBuf]) -> Option<PathBuf> {
+/// (an empty IVF) and `added_*` (the real vectors); only the latter is useful. `sole_model`: the
+/// model is the only one in its folder, so a lone index there is its own whatever the names say.
+pub fn pair_index(model: &Path, indexes: &[PathBuf], sole_model: bool) -> Option<PathBuf> {
     let usable: Vec<&PathBuf> = indexes
         .iter()
         .filter(|p| !p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("trained_")))
         .collect();
-    if usable.len() == 1 {
+    if usable.len() == 1 && sole_model {
         return Some(usable[0].clone());
     }
     let key = base_key(&model.file_stem()?.to_string_lossy());
@@ -168,10 +169,12 @@ pub fn collect(paths: &[PathBuf], scratch: &Path) -> (Vec<Candidate>, Vec<Value>
     files.retain(|f| seen.insert(f.clone()));
     let models: Vec<&PathBuf> = files.iter().filter(|f| ext_is(f, "pth")).collect();
     let mut out = Vec::new();
-    for m in models {
+    for m in &models {
         let dir = m.parent().map(Path::to_path_buf).unwrap_or_default();
         let indexes: Vec<PathBuf> = files.iter().filter(|f| ext_is(f, "index") && f.parent() == Some(dir.as_path())).cloned().collect();
-        out.push(Candidate { model: m.clone(), index: pair_index(m, &indexes) });
+        // A folder of several models with one index: that index belongs to at most one of them.
+        let sole = models.iter().filter(|o| o.parent() == m.parent()).count() == 1;
+        out.push(Candidate { model: (*m).clone(), index: pair_index(m, &indexes, sole) });
     }
     (out, failed)
 }
@@ -257,12 +260,15 @@ mod tests {
             p("x/added_IVF1_Flat_nprobe_1_DonaldTrump_v2.index"),
             p("x/added_IVF9_Flat_nprobe_1_Other_v2.index"),
         ];
-        assert_eq!(pair_index(&m, &ix), Some(ix[1].clone()));
-        // A lone usable index is taken whatever its name.
-        assert_eq!(pair_index(&m, &[p("x/model.index")]), Some(p("x/model.index")));
+        assert_eq!(pair_index(&m, &ix, true), Some(ix[1].clone()));
+        // A lone usable index is taken whatever its name, if the model is alone in its folder.
+        assert_eq!(pair_index(&m, &[p("x/model.index")], true), Some(p("x/model.index")));
+        // Next to other models it has to match by name: it may well be one of theirs.
+        assert_eq!(pair_index(&m, &[p("x/added_IVF9_Other_v2.index")], false), None);
+        assert_eq!(pair_index(&m, &[p("x/added_IVF1_DonaldTrump_v2.index")], false), Some(p("x/added_IVF1_DonaldTrump_v2.index")));
         // Several unrelated ones: no guess.
-        assert_eq!(pair_index(&m, &[p("x/a.index"), p("x/b.index")]), None);
-        assert_eq!(pair_index(&m, &[p("x/trained_IVF1_DonaldTrump.index")]), None);
+        assert_eq!(pair_index(&m, &[p("x/a.index"), p("x/b.index")], true), None);
+        assert_eq!(pair_index(&m, &[p("x/trained_IVF1_DonaldTrump.index")], true), None);
     }
 }
 
