@@ -48,7 +48,11 @@
         <p class="meta">
           <span class="num">{v.info.sr / 1000} kHz</span>
           <span>RVC {v.info.version}</span>
-          <span>{hasIndex ? "Index paired" : "No index"}</span>
+          {#if store.indexSuspect(v)}
+            <span class="warn" title="Open the voice's menu in the library to choose its own index or remove this one.">Index shared with {v.index_shared_with?.join(", ")}</span>
+          {:else}
+            <span>{hasIndex ? "Index paired" : "No index"}</span>
+          {/if}
           {#if v.info.epoch}<span class="num">{v.info.epoch} epochs</span>{/if}
           {#if switching}<span class="switching">Switching</span>{/if}
         </p>
@@ -211,6 +215,9 @@
   }
   .switching {
     color: var(--accent);
+  }
+  .warn {
+    color: var(--warn);
   }
   .power {
     display: inline-flex;

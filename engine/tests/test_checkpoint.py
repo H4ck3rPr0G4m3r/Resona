@@ -1,3 +1,6 @@
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 
 from resona_engine.rvc import checkpoint
@@ -18,6 +21,17 @@ def test_parse_old_style_sample_rate():
     assert checkpoint._parse_sr(48000) == 48000
     with pytest.raises(checkpoint.CheckpointError):
         checkpoint._parse_sr("22k")
+
+
+def test_unsupported_variants_are_refused():
+    ok = checkpoint.ModelInfo(
+        path=Path("v.pth"), name="v", sr=40000, version="v2", f0=True, vocoder="HiFi-GAN",
+        vocoder_architecture=None, embedder="contentvec", config=(), hash="0" * 16,
+    )
+    assert checkpoint.check_supported(ok) is ok
+    for field, value in [("vocoder", "RefineGAN"), ("embedder", "spin")]:
+        with pytest.raises(checkpoint.CheckpointError, match=value):
+            checkpoint.check_supported(replace(ok, **{field: value}))
 
 
 def test_rejects_non_checkpoint(tmp_path):

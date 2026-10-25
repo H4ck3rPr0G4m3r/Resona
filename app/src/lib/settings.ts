@@ -82,6 +82,13 @@ export const DEFAULT_SETTINGS: Settings = {
   fx: DEFAULT_FX,
 };
 
+/** The engine refuses to start unless crossfade + search/2 fits inside the lookahead: shrink the
+ *  crossfade (in its 10 ms steps) until it does. */
+export function fitCrossfade(s: Settings["stream"]) {
+  const room = (s.lookahead_ms ?? 40) - (s.sola_search_ms ?? 10) / 2;
+  if ((s.crossfade_ms ?? 10) > room) s.crossfade_ms = Math.max(0, Math.floor(room / 10) * 10);
+}
+
 /** Per-voice profile: what selecting a voice restores. */
 export type Profile = Pick<LiveParams, "pitch" | "formant" | "index_rate" | "protect"> & {
   schema: number;

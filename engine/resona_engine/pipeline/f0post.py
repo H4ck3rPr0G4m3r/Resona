@@ -45,7 +45,9 @@ def _segments(voiced: np.ndarray):
 
 
 class F0Post:
-    HISTORY = 64
+    # Committed frames kept. It must cover the longest window (2 s context + block + lookahead):
+    # an older frame falls back to its raw value, so a fixed octave glitch would come back.
+    HISTORY = 512
 
     def __init__(self, cfg: F0PostConfig | None = None):
         self.cfg = cfg or F0PostConfig()

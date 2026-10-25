@@ -258,7 +258,7 @@ class RVCv2Backend:
         return f0, feats50
 
     def _render(self, voice: Voice, p: LiveParams, feats50, f0p, voiced, abs_frame0: int):
-        """Synthesize the output region for one voice. → (audio [out_len] OUT_SR, shifted f0)."""
+        """Synthesize the output region for one voice. → audio [out_len] at OUT_SR."""
         f0s = f0p * (2.0 ** (p.pitch / 12.0))
         phone = build_phone(feats50, voice, voiced, p, self.T_all)
         pitch = to_coarse(f0s).to(self.device).unsqueeze(0)
@@ -271,7 +271,7 @@ class RVCv2Backend:
         else:
             wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
         off = self.region_start - d0 * self.hop_out
-        return wav[off : off + self.out_len].clone(), f0s
+        return wav[off : off + self.out_len].clone()
 
     def _sync(self):
         if self.profile and self.device.type == "cuda":
@@ -299,21 +299,22 @@ class RVCv2Backend:
         f0_raw = f0_raw_all[:T]
         t1 = self._sync()
 
-        f0_np = self.f0post.process(abs_frame0, f0_raw.cpu().numpy())
+        f0_raw_np = f0_raw.cpu().numpy()
+        f0_np = self.f0post.process(abs_frame0, f0_raw_np)
         f0p = torch.from_numpy(f0_np).float().to(self.device)
         if ext:
             f0p = torch.cat([f0p, torch.flip(f0p[-ext:], [0])])
         t2 = self._sync()
 
         voiced = f0p > 0
-        out, f0s = self._render(self.voice, p, feats50, f0p, voiced, abs_frame0)
+        out = self._render(self.voice, p, feats50, f0p, voiced, abs_frame0)
         if self._xfade is not None:
             old, old_p, start, n = self._xfade
             region0 = abs_frame0 * self.hop_out + self.region_start
             if region0 >= start + n:
                 self._xfade = None
             else:
-                prev, _ = self._render(old, old_p or p, feats50, f0p, voiced, abs_frame0)
+                prev = self._render(old, old_p or p, feats50, f0p, voiced, abs_frame0)
                 idx = torch.arange(self.out_len, device=self.device) + region0
                 w = ((idx - start).float() / n).clamp(0, 1) * (math.pi / 2)
                 out = prev * torch.cos(w) + out * torch.sin(w)
@@ -321,8 +322,9 @@ class RVCv2Backend:
         self.f0post.commit(commit_upto)
         t3 = self._sync()
 
+        # The pitch trace comes from the CPU copies, not two more GPU->CPU syncs per block.
         bs, be = self.C // HOP_IN, (self.C + self.B) // HOP_IN
-        self.last_f0 = (f0_raw[bs:be].cpu().numpy(), f0s[bs:be].cpu().numpy())
+        self.last_f0 = (f0_raw_np[bs:be], (f0_np[bs:be] * 2.0 ** (p.pitch / 12.0)).astype(np.float32))
         self.last_times = StageTimes(
             features_ms=(t1 - t0) * 1e3, f0post_ms=(t2 - t1) * 1e3, synth_ms=(t3 - t2) * 1e3,
             total_ms=(t3 - t0) * 1e3,

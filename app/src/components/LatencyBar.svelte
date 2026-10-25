@@ -2,16 +2,18 @@
   import { store } from "../lib/store.svelte";
 
   let lat = $derived(store.stats?.latency ?? null);
+  // Every term of total_ms gets a segment, so the bar adds up to the number next to it.
   let segs = $derived(
     lat
       ? [
-          { key: "in", name: "Input", ms: lat.input_ms },
-          { key: "block", name: "Block", ms: lat.block_ms },
-          { key: "look", name: "Lookahead", ms: lat.lookahead_ms },
-          { key: "gpu", name: "GPU", ms: lat.compute_ms },
-          { key: "buf", name: "Buffer", ms: lat.buffer_ms },
-          { key: "out", name: "Output", ms: lat.output_ms },
-        ]
+          { key: "in", name: "Input", short: "In", ms: lat.input_ms },
+          { key: "fx", name: "Effects", short: "FX", ms: lat.effects_ms ?? 0 },
+          { key: "block", name: "Block", short: "Block", ms: lat.block_ms },
+          { key: "look", name: "Lookahead", short: "Look", ms: lat.lookahead_ms },
+          { key: "gpu", name: "GPU", short: "GPU", ms: lat.compute_ms },
+          { key: "buf", name: "Buffer", short: "Buf", ms: lat.buffer_ms },
+          { key: "out", name: "Output", short: "Out", ms: lat.output_ms },
+        ].filter((g) => g.key !== "fx" || g.ms > 0)
       : [],
   );
   let total = $derived(lat ? lat.total_ms : 0);
@@ -28,10 +30,9 @@
   <div class="bar" class:empty={!lat}>
     {#each segs as g (g.key)}
       <div class="seg {g.key}" style:flex-grow={Math.max(g.ms, 0.5)} title="{g.name}: {g.ms.toFixed(1)} ms">
-        {#if g.ms / total > 0.075}
-          <span class="seg-name">{g.name}</span>
-          <span class="seg-ms num">{Math.round(g.ms)}</span>
-        {/if}
+        <span class="seg-name full">{g.name}</span>
+        <span class="seg-name short">{g.short}</span>
+        <span class="seg-ms num">{Math.round(g.ms)}</span>
       </div>
     {/each}
   </div>
@@ -99,6 +100,7 @@
   .seg {
     flex-basis: 0;
     min-width: 3px;
+    container-type: inline-size; /* labels follow the segment's real width, not its share */
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -129,6 +131,32 @@
   }
   .seg-ms {
     color: var(--text);
+  }
+  /* Narrow segments fall back to "In 10", then to the number, then to nothing. Widths are the
+     content box, measured for Geist at 11 px with a two-digit value. */
+  .seg-name.short {
+    display: none;
+  }
+  @container (max-width: 57px) {
+    .seg-name.full {
+      display: none;
+    }
+    .seg-name.short {
+      display: inline;
+    }
+  }
+  @container (max-width: 43px) {
+    .seg-name.short {
+      display: none;
+    }
+    .seg-ms {
+      margin-inline: auto;
+    }
+  }
+  @container (max-width: 13px) {
+    .seg-ms {
+      display: none;
+    }
   }
   .facts {
     display: flex;

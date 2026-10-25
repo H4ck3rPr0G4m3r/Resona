@@ -13,7 +13,7 @@ import {
   type Stats,
   type Take,
 } from "./api";
-import { DEFAULT_PROFILE, DEFAULT_SETTINGS, mergeDefaults, type Profile, type Settings } from "./settings";
+import { DEFAULT_PROFILE, DEFAULT_SETTINGS, fitCrossfade, mergeDefaults, type Profile, type Settings } from "./settings";
 
 export const TRACE_FRAMES = 500; // 5 s at 100 fps
 
@@ -188,8 +188,20 @@ class Store {
   private flushParams = debounce(() => {
     const patch = this.pendingPatch;
     this.pendingPatch = {};
-    if (this.live) api.setParams(patch).catch(() => {});
+    if (!this.live) return;
+    api.setParams(patch).catch(() => {
+      // The engine answers RPCs one at a time, so this can time out behind a voice load. Keep
+      // the values (newer edits win) and try again, or the UI shows a pitch the engine never got.
+      this.pendingPatch = { ...patch, ...this.pendingPatch };
+      setTimeout(this.retryParams, 500);
+    });
   }, 30);
+
+  private retryParams = () => {
+    if (!this.live) return;
+    if (this.running) this.flushParams();
+    else setTimeout(this.retryParams, 500); // engine restarting: wait until it is back
+  };
 
   setParam<K extends keyof Profile>(key: K, value: Profile[K]) {
     this.profile[key] = value;
@@ -386,6 +398,26 @@ class Store {
     await this.applyHotkeys();
   }
 
+  /** The voice uses an index that other voices use too and that is not named after it. */
+  indexSuspect(v: LibraryVoice) {
+    return !!v.index_shared_with?.length && !v.index_owner;
+  }
+
+  /** Give a voice another index (a copied `.index` file), or none. */
+  async setVoiceIndex(v: LibraryVoice, path: string | null) {
+    if (this.live && v.id === this.activeVoiceId) {
+      this.notify("error", "Switch to another voice or stop before changing the active voice's index.");
+      return;
+    }
+    try {
+      await api.librarySetIndex(v.id, path);
+      await this.refreshLibrary();
+      this.notify("info", path ? `${v.name} now uses ${path.split(/[\\/]/).pop()}` : `${v.name} no longer uses an index`);
+    } catch (e) {
+      this.notify("error", `Index not changed: ${e}`);
+    }
+  }
+
   async importPaths(paths: string[]) {
     if (!paths.length || this.importing) return;
     this.importing = { done: 0, total: 0, name: null };
@@ -426,7 +458,9 @@ class Store {
   }
 
   private streamSettings() {
-    return { ...this.settings.stream };
+    const s = { ...this.settings.stream };
+    fitCrossfade(s); // settings saved before the drawer clamped it
+    return s;
   }
 
   async start() {
@@ -514,6 +548,8 @@ class Store {
 
   async applyShell() {
     await this.applyHotkeys();
+    // Push to talk means muted until the key is held, from the first second after a launch too.
+    if (this.settings.ptt_enabled && !this.muted) await api.setMuted(true).catch(() => {});
     await api.setShellPrefs(this.settings.close_to_tray, this.settings.autostart).catch((e) =>
       this.notify("error", `Startup setting not applied: ${e}`),
     );

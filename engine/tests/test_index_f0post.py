@@ -67,6 +67,23 @@ def test_committed_frames_are_frozen():
     assert np.allclose(second[5:], 300.0)
 
 
+def test_committed_frames_stay_frozen_across_the_whole_window():
+    # Stream like the backend: 2 s context + 100 ms block + 200 ms lookahead (the UI maxima).
+    C, B, L = 200, 10, 20
+    T = C + B + L
+    raw = np.full(3000, 200.0)
+    raw[600:603] = 400.0  # folded back to 200 Hz while the frames are new
+    post = F0Post()
+    seen = set()
+    for blk in range(120):
+        a0 = blk * B
+        out = post.process(a0, raw[a0 : a0 + T])
+        post.commit(a0 + C + B)
+        if a0 <= 601 < a0 + T:
+            seen.add(float(out[601 - a0]))
+    assert seen == {200.0}
+
+
 def test_coarse_range():
     c = to_coarse(torch.tensor([0.0, 50.0, 1100.0, 5000.0]))
     assert c.tolist()[0] == 1 and c.tolist()[-1] == 255

@@ -34,6 +34,19 @@ def log(*a) -> None:
     print("[engine]", *a, file=sys.stderr, flush=True)
 
 
+def _file_key(path: str | None) -> str | None:
+    """Identity of a model/index file for the voice cache: a file replaced under the same name
+    (a voice given another, equally generically named index) must not count as unchanged."""
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return str(p)
+    return f"{p}|{st.st_size}|{st.st_mtime_ns}"
+
+
 class StubBackend:
     """Torch-free stand-in used to test the host: echoes the input with the real timing contract."""
 
@@ -82,6 +95,7 @@ class Engine:
         self.backend = None
         self.voices: dict[str, object] = {}
         self.voice_order: deque[str] = deque()
+        self.voice_src: dict[str, tuple] = {}  # vid -> (model, index) file keys it was loaded from
         self.active: str | None = None
         self.params = None
         self.cfg = None
@@ -156,10 +170,10 @@ class Engine:
 
         @m("model.inspect")
         def model_inspect(p):
-            from .rvc.checkpoint import CheckpointError, inspect
+            from .rvc.checkpoint import CheckpointError, check_supported, inspect
 
             try:
-                return inspect(p["path"]).to_dict()
+                return check_supported(inspect(p["path"])).to_dict()
             except CheckpointError as e:
                 raise RpcError(str(e), -32010)
 
@@ -177,6 +191,7 @@ class Engine:
                 if p["id"] == self.active:
                     raise RpcError("cannot unload the active voice")
                 self._forget(self.voices.pop(p["id"], None))
+                self.voice_src.pop(p["id"], None)
                 if p["id"] in self.voice_order:
                     self.voice_order.remove(p["id"])
             return True
@@ -222,7 +237,8 @@ class Engine:
 
         self._ensure_features()
         cached = self.voices.get(vid)
-        if cached is not None and str(cached.info.path) == str(Path(path)):
+        src = (_file_key(path), _file_key(index_path))
+        if cached is not None and self.voice_src.get(vid) == src:
             info = cached.info.to_dict()  # already resident (switching back to a recent voice)
             info["has_index"] = cached.index is not None
             info["index_size"] = cached.index.size if cached.index is not None else 0
@@ -233,7 +249,11 @@ class Engine:
         except (CheckpointError, ValueError) as e:
             raise RpcError(str(e), -32010)
         with self.lock:
+            replaced = self.voices.get(vid)  # same voice, other index (or file): drop its graph
+            if replaced is not None and (self.backend is None or self.backend.voice is not replaced):
+                self._forget(replaced)
             self.voices[vid] = voice
+            self.voice_src[vid] = src
             if vid in self.voice_order:
                 self.voice_order.remove(vid)
             self.voice_order.append(vid)
@@ -243,6 +263,7 @@ class Engine:
                     break
                 self.voice_order.remove(old)
                 self._forget(self.voices.pop(old, None))
+                self.voice_src.pop(old, None)
         if self.backend is not None and self.cfg is not None:
             # Capture now so activation is seamless; outside the lock so streaming continues.
             self.backend.prepare_voice(voice, lock=self.lock)
@@ -275,7 +296,10 @@ class Engine:
                 self.backend = RVCv2Backend(self._ensure_features(), voice)
             else:
                 streaming = self.running.is_set()
+                prev = self.backend.voice
                 self.backend.set_voice(voice, xfade_ms if streaming else 0.0, old_params)
+                if not streaming and prev is not voice and all(v is not prev for v in self.voices.values()):
+                    self._forget(prev)  # replaced by a reload (another index): free its graph
             self.active = vid
             return {"active": vid, "layout": self.layout.to_dict() if self.layout else None}
 

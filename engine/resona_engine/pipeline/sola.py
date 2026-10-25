@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 
+# Largest move of the seam from one block to the next: 1 ms at 48 kHz. Blocks are rendered on one
+# absolute timeline, so the previous offset is already right; a whole-window search let voiced audio
+# above ~200 Hz line up a pitch period off and skip or repeat it (see host/dsp/src/sola.rs).
+MAX_STEP = 48
+
 
 class Sola:
     def __init__(self, crossfade: int, search: int):
@@ -22,14 +27,16 @@ class Sola:
         self.seam_stats.clear()
 
     def best_offset(self, head: np.ndarray) -> int:
-        """Offset k in [0, S] maximizing normalized cross-correlation of head[k:k+X] with the tail."""
+        """Offset k within MAX_STEP of the previous one (and in [0, S]) maximizing the normalized
+        cross-correlation of head[k:k+X] with the tail."""
         if self.tail is None or self.X == 0:
             return self.S // 2
         X, S = self.X, self.S
-        win = np.lib.stride_tricks.sliding_window_view(head[: X + S], X)  # [S+1, X]
+        lo, hi = max(self.last_offset - MAX_STEP, 0), min(self.last_offset + MAX_STEP, S)
+        win = np.lib.stride_tricks.sliding_window_view(head[lo : hi + X], X)  # [hi-lo+1, X]
         num = win @ self.tail
         den = np.sqrt((win * win).sum(1) + 1e-8)
-        return int(np.argmax(num / den))
+        return lo + int(np.argmax(num / den))
 
     def process(self, y: np.ndarray, block: int) -> np.ndarray:
         """y: block + X + S samples. Returns `block` samples of continuous output."""

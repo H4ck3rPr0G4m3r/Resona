@@ -88,6 +88,18 @@
     fadeL = flow.scrollLeft > 1;
     fadeR = flow.scrollLeft + flow.clientWidth < flow.scrollWidth - 1;
   }
+  function scrolled() {
+    edges();
+    addMenu = null; // a menu placed at its button would be left behind
+    outMenu = false;
+  }
+  /** Menus are fixed-position so the scrolling strip doesn't clip them; the default (static)
+   *  position ignores the strip's scroll offset, so place each one above its button. */
+  function place(pop: HTMLElement) {
+    const r = (pop.previousElementSibling as HTMLElement).getBoundingClientRect();
+    pop.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8))}px`;
+    pop.style.bottom = `${window.innerHeight - r.top + 10}px`;
+  }
   // The scrollbar is hidden, so a vertical wheel scrolls the chain sideways.
   function wheel(e: WheelEvent) {
     if (!flow || flow.scrollWidth <= flow.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
@@ -164,7 +176,7 @@
       <Plus size={13} weight="bold" />
     </button>
     {#if addMenu === chain}
-      <div class="pop" role="menu">
+      <div class="pop" role="menu" use:place>
         {#each addable(chain) as k (k.kind)}
           <button role="menuitem" onclick={() => { store.addSlot(chain, k.kind); addMenu = null; }}>{k.name}</button>
         {/each}
@@ -176,55 +188,57 @@
 <div class="strip-wrap">
   <SlotEditor />
   <footer class="strip" aria-label="Signal chain">
-    <div class="flow" class:fade-l={fadeL} class:fade-r={fadeR} role="list" bind:this={flow} onscroll={edges} onwheel={wheel}>
-      <SourceNode />
-      <CaretRight size={11} class="arrow" />
-      {@render chips("input")}
-      <button
-        class="chip special"
-        class:off={!s.fx.gate.enabled || s.fx.singing}
-        class:editing={store.fxEditing && "special" in store.fxEditing && store.fxEditing.special === "gate"}
-        onclick={() => editSpecial("gate")}
-      >
-        <span class="lamp" class:on={s.fx.gate.enabled && !s.fx.singing} class:shut={store.live && store.stats?.gate_open === false}></span>
-        <span class="nm">Voice gate</span>
-      </button>
-      <button class="sing" aria-pressed={s.fx.singing} title="Singing mode: bypass noise suppression and the voice gate" onclick={() => store.setSinging(!s.fx.singing)}>
-        <MusicNotes size={14} />
-      </button>
-      <CaretRight size={11} class="arrow" />
-      <div class="node voice"><Waveform size={15} /><span class="dev">{store.selected?.name ?? "No voice"}</span></div>
-      <CaretRight size={11} class="arrow" />
-      {@render chips("output")}
-      <div class="pop-wrap">
-        <button class="add pop-btn" class:own={store.voiceHasChain} aria-label="Output chain options" aria-expanded={outMenu} onclick={() => (outMenu = !outMenu)}>
-          <DotsThree size={14} weight="bold" />
+    <div class="flow-wrap" class:fade-l={fadeL} class:fade-r={fadeR}>
+      <div class="flow" role="list" bind:this={flow} onscroll={scrolled} onwheel={wheel}>
+        <SourceNode />
+        <CaretRight size={11} class="arrow" />
+        {@render chips("input")}
+        <button
+          class="chip special"
+          class:off={!s.fx.gate.enabled || s.fx.singing}
+          class:editing={store.fxEditing && "special" in store.fxEditing && store.fxEditing.special === "gate"}
+          onclick={() => editSpecial("gate")}
+        >
+          <span class="lamp" class:on={s.fx.gate.enabled && !s.fx.singing} class:shut={store.live && store.stats?.gate_open === false}></span>
+          <span class="nm">Voice gate</span>
         </button>
-        {#if outMenu}
-          <div class="pop" role="menu">
-            <button role="menuitemcheckbox" aria-checked={store.voiceHasChain} disabled={!store.selected} onclick={() => { store.setVoiceChain(!store.voiceHasChain); outMenu = false; }}>
-              {store.voiceHasChain ? "Use the shared output chain" : "Give this voice its own chain"}
-            </button>
-            <button role="menuitem" onclick={exportChain}>Export preset</button>
-            <button role="menuitem" onclick={importChain}>Import preset</button>
-          </div>
-        {/if}
+        <button class="sing" aria-pressed={s.fx.singing} title="Singing mode: bypass noise suppression and the voice gate" onclick={() => store.setSinging(!s.fx.singing)}>
+          <MusicNotes size={14} />
+        </button>
+        <CaretRight size={11} class="arrow" />
+        <div class="node voice"><Waveform size={15} /><span class="dev">{store.selected?.name ?? "No voice"}</span></div>
+        <CaretRight size={11} class="arrow" />
+        {@render chips("output")}
+        <div class="pop-wrap">
+          <button class="add pop-btn" class:own={store.voiceHasChain} aria-label="Output chain options" aria-expanded={outMenu} onclick={() => (outMenu = !outMenu)}>
+            <DotsThree size={14} weight="bold" />
+          </button>
+          {#if outMenu}
+            <div class="pop" role="menu" use:place>
+              <button role="menuitemcheckbox" aria-checked={store.voiceHasChain} disabled={!store.selected} onclick={() => { store.setVoiceChain(!store.voiceHasChain); outMenu = false; }}>
+                {store.voiceHasChain ? "Use the shared output chain" : "Give this voice its own chain"}
+              </button>
+              <button role="menuitem" onclick={exportChain}>Export preset</button>
+              <button role="menuitem" onclick={importChain}>Import preset</button>
+            </div>
+          {/if}
+        </div>
+        <button
+          class="chip special"
+          class:off={!s.fx.limiter.enabled}
+          class:editing={store.fxEditing && "special" in store.fxEditing && store.fxEditing.special === "limiter"}
+          onclick={() => editSpecial("limiter")}
+        >
+          <span class="lamp" class:on={s.fx.limiter.enabled}></span>
+          <span class="nm">Limiter</span>
+          <span class="sum num">{s.fx.limiter.ceiling_db} dB</span>
+        </button>
+        <CaretRight size={11} class="arrow" />
+        <button class="node" onclick={openDevices} title="Output device">
+          <SpeakerHigh size={15} />
+          <span class="dev">{store.live && live ? live.output.device_name : devName(store.outputs, s.output_device)}</span>
+        </button>
       </div>
-      <button
-        class="chip special"
-        class:off={!s.fx.limiter.enabled}
-        class:editing={store.fxEditing && "special" in store.fxEditing && store.fxEditing.special === "limiter"}
-        onclick={() => editSpecial("limiter")}
-      >
-        <span class="lamp" class:on={s.fx.limiter.enabled}></span>
-        <span class="nm">Limiter</span>
-        <span class="sum num">{s.fx.limiter.ceiling_db} dB</span>
-      </button>
-      <CaretRight size={11} class="arrow" />
-      <button class="node" onclick={openDevices} title="Output device">
-        <SpeakerHigh size={15} />
-        <span class="dev">{store.live && live ? live.output.device_name : devName(store.outputs, s.output_device)}</span>
-      </button>
     </div>
     <div class="gain">
       <div class="f">
@@ -251,6 +265,12 @@
     border-top: 1px solid var(--line);
     background: var(--panel);
   }
+  .flow-wrap {
+    position: relative;
+    flex: 1;
+    display: flex;
+    min-width: 0;
+  }
   .flow {
     flex: 1;
     display: flex;
@@ -262,22 +282,38 @@
     padding: 4px 2px;
     scrollbar-width: none;
   }
-  /* Edge fades show there is more chain to scroll to. */
-  .flow.fade-r {
-    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+  /* Edge fades show there is more chain to scroll to. They are overlays rather than a mask on
+     .flow: a mask also clips the fixed-position menus inside it, which then never show. */
+  .flow-wrap::before,
+  .flow-wrap::after {
+    content: "";
+    position: absolute;
+    z-index: 1;
+    top: 0;
+    bottom: 0;
+    width: 28px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
   }
-  .flow.fade-l {
-    mask-image: linear-gradient(to right, transparent, #000 28px);
+  .flow-wrap::before {
+    left: 0;
+    background: linear-gradient(to right, var(--panel), transparent);
   }
-  .flow.fade-l.fade-r {
-    mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+  .flow-wrap::after {
+    right: 0;
+    background: linear-gradient(to left, var(--panel), transparent);
+  }
+  .flow-wrap.fade-l::before,
+  .flow-wrap.fade-r::after {
+    opacity: 1;
   }
   .flow :global(.arrow) {
     flex: none;
     color: var(--text-3);
   }
   .node {
-    flex: 0 1 auto;
+    flex: none; /* the strip scrolls; a shrinking node would just lose its name */
     display: inline-flex;
     align-items: center;
     gap: 7px;
@@ -295,7 +331,6 @@
     color: var(--text);
   }
   .node.voice {
-    flex: none;
     max-width: 180px;
     color: var(--text);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
@@ -367,9 +402,12 @@
   button.lamp:hover:not(.on)::before {
     border-color: var(--text-3);
   }
+  /* Name and summary share a baseline; the line as a whole is centred on the lamp. */
   .chip-body {
-    display: inline-flex;
+    display: inline-grid;
+    grid-auto-flow: column;
     align-items: baseline;
+    align-content: center;
     gap: 7px;
     height: 100%;
     padding: 0 10px 0 2px;
@@ -423,7 +461,6 @@
   .pop {
     position: fixed;
     z-index: var(--z-drawer);
-    transform: translateY(calc(-100% - 40px));
     display: grid;
     min-width: 200px;
     padding: 5px;

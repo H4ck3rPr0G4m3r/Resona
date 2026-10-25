@@ -111,13 +111,19 @@ def inspect(path: str | Path) -> ModelInfo:
     return _info(path, _read(path))
 
 
+def check_supported(info: ModelInfo) -> ModelInfo:
+    """Raise for a checkpoint this engine cannot run. The library import checks this too, so such
+    a model is refused with its reason up front instead of failing the first time it is started."""
+    if info.vocoder != "HiFi-GAN":
+        raise CheckpointError(f"{info.path.name}: unsupported vocoder variant {info.vocoder!r}")
+    if info.embedder != "contentvec":
+        raise CheckpointError(f"{info.path.name}: unsupported embedder {info.embedder!r}")
+    return info
+
+
 def load_state(path: str | Path) -> tuple[ModelInfo, dict[str, torch.Tensor]]:
     path = Path(path)
     ck = _read(path)
-    info = _info(path, ck)
-    if info.vocoder != "HiFi-GAN":
-        raise CheckpointError(f"{path.name}: unsupported vocoder variant {info.vocoder!r}")
-    if info.embedder != "contentvec":
-        raise CheckpointError(f"{path.name}: unsupported embedder {info.embedder!r}")
+    info = check_supported(_info(path, ck))
     state = {k: v for k, v in ck["weight"].items() if not k.startswith("enc_q.")}
     return info, state

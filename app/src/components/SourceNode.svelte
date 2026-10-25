@@ -86,7 +86,7 @@
 
 <style>
   .node {
-    flex: 0 1 auto;
+    flex: none; /* the strip scrolls; a shrinking node would just lose its name */
     display: inline-flex;
     align-items: center;
     gap: 7px;
