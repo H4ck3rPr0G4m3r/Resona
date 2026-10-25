@@ -270,9 +270,9 @@ impl CaptureSide {
 /// sits above the jitter target — after a start-up burst or from slow clock drift — the excess
 /// is skipped with a short crossfade, so latency never creeps up.
 ///
-/// The target itself adapts: an underrun raises it by `ADAPT_UP`, and after `RELAX_AFTER` without
-/// one it eases back toward the configured minimum, so a GPU that spikes now and then trades a few
-/// ms of latency for no dropouts instead of glitching repeatedly.
+/// The target itself adapts: an underrun raises it by `ADAPT_UP` (up to `adapt_max` above the
+/// configured minimum), and after `RELAX_AFTER` without one it eases back, so a GPU that spikes now
+/// and then trades some latency for no dropouts instead of glitching repeatedly.
 pub struct RenderSide {
     fifo: rtrb::Consumer<f32>,
     starved: bool,
@@ -280,6 +280,7 @@ pub struct RenderSide {
     last: f32,
     prefill: usize,
     base_prefill: usize,
+    adapt_max: usize,
     clean: usize,
     window_min: usize,
     window_pos: usize,
@@ -295,13 +296,16 @@ pub struct RenderSide {
 const CONTROL_WINDOW: usize = RATE; // 1 s
 const CONTROL_SLACK: usize = 3 * RATE / 1000; // tolerate 3 ms above target
 const ADAPT_UP: usize = 5 * RATE / 1000;
-const ADAPT_MAX: usize = 40 * RATE / 1000; // above the configured target
+/// Least headroom the target may grow by. With larger blocks it may grow by one block: a GPU
+/// shared with a game delays blocks by tens of ms, and a 40 ms cap then left a 100 ms block
+/// dropping out over and over instead of settling.
+const ADAPT_MAX: usize = 40 * RATE / 1000;
 const ADAPT_DOWN: usize = RATE / 1000;
 const RELAX_AFTER: usize = 20 * RATE; // underrun-free time before easing the target down
 const RELAX_EVERY: usize = 3 * RATE;
 
 impl RenderSide {
-    fn new(fifo: rtrb::Consumer<f32>, prefill: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
+    fn new(fifo: rtrb::Consumer<f32>, prefill: usize, adapt_max: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
         Self {
             fifo,
             starved: true,
@@ -309,6 +313,7 @@ impl RenderSide {
             last: 0.0,
             prefill: prefill.max(1),
             base_prefill: prefill.max(1),
+            adapt_max,
             clean: 0,
             window_min: usize::MAX,
             window_pos: 0,
@@ -354,7 +359,7 @@ impl RenderSide {
             if self.count_underruns {
                 self.shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
-            self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + ADAPT_MAX);
+            self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + self.adapt_max);
             self.clean = 0;
             if n > 0 {
                 self.last = out[n - 1];
@@ -638,8 +643,9 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
     let (dry_p, dry_c) = rtrb::RingBuffer::new(fifo_cap / 2);
     let (tx, rx) = crossbeam_channel::unbounded();
     let jitter = (jitter_ms * RATE as f32 / 1000.0) as usize;
+    let adapt_max = ADAPT_MAX.max(layout.block_out * RATE / layout.model_sr.max(1));
     let render_side = |fifo, is_monitor: bool| {
-        RenderSide::new(fifo, jitter, is_monitor.then(|| shared.clone()), shared.clone(), !is_monitor)
+        RenderSide::new(fifo, jitter, adapt_max, is_monitor.then(|| shared.clone()), shared.clone(), !is_monitor)
     };
     let render = render_side(out_c, false);
     let monitor = mon_c.map(|c| render_side(c, true));
@@ -834,7 +840,7 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
         let base = 10 * RATE / 1000;
-        let mut r = RenderSide::new(rx, base, None, shared.clone(), true);
+        let mut r = RenderSide::new(rx, base, ADAPT_MAX, None, shared.clone(), true);
         let mut out = [0.0f32; 480];
         feed(&mut tx, base + 240);
         r.process(&mut out);

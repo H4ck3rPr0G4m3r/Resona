@@ -122,6 +122,9 @@ class RVCv2Backend:
         self._g_rmvpe: graphs.Graph | None = None
         self._g_synth: dict[int, graphs.Graph] = {}  # id(voice.synth) -> graph
         self._side = torch.cuda.Stream(self.device) if self.use_graphs else None
+        # CUDA spin-waits by default: a whole CPU core, twice per block, taken from a game that
+        # is running beside us. A blocking event lets the thread sleep until the GPU is done.
+        self._done = torch.cuda.Event(blocking=True) if self.device.type == "cuda" else None
 
     # -- configuration ---------------------------------------------------------------------
     def set_voice(self, voice: Voice, xfade_ms: float = 0.0, old_params: LiveParams | None = None) -> None:
@@ -278,6 +281,12 @@ class RVCv2Backend:
             torch.cuda.synchronize()
         return time.perf_counter()
 
+    def _wait(self) -> None:
+        """Wait for the work queued on the current stream, sleeping instead of spinning."""
+        if self._done is not None:
+            self._done.record()
+            self._done.synchronize()
+
     @torch.no_grad()
     def process(self, x16k: torch.Tensor, p: LiveParams) -> torch.Tensor:
         if self.cfg is None or self.voice is None:
@@ -299,6 +308,7 @@ class RVCv2Backend:
         f0_raw = f0_raw_all[:T]
         t1 = self._sync()
 
+        self._wait()  # features done: the copy below no longer has to wait on the GPU
         f0_raw_np = f0_raw.cpu().numpy()
         f0_np = self.f0post.process(abs_frame0, f0_raw_np)
         f0p = torch.from_numpy(f0_np).float().to(self.device)
@@ -318,6 +328,7 @@ class RVCv2Backend:
                 idx = torch.arange(self.out_len, device=self.device) + region0
                 w = ((idx - start).float() / n).clamp(0, 1) * (math.pi / 2)
                 out = prev * torch.cos(w) + out * torch.sin(w)
+        self._wait()  # so the caller's copy of `out` doesn't spin-wait either
         commit_upto = abs_frame0 + (self.C + self.B) // HOP_IN
         self.f0post.commit(commit_upto)
         t3 = self._sync()
