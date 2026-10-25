@@ -8,11 +8,16 @@ use super::{Effect, Smooth};
 pub const FRAME: usize = DenoiseState::FRAME_SIZE; // 480
 const SCALE: f32 = 32768.0; // RNNoise works on 16-bit-range floats
 
+/// Total delay: one frame of buffering (a frame is processed once it is complete), plus one
+/// frame inside RNNoise, whose overlap-add output for frame n only completes with frame n + 1.
+const LATENCY: usize = 2 * FRAME;
+
 pub struct Denoise {
     st: Box<DenoiseState<'static>>,
     inbuf: [f32; FRAME],
-    raw: [f32; FRAME],  // the previous frame, unprocessed (dry, latency-matched)
-    den: [f32; FRAME],  // the previous frame, denoised
+    prev: [f32; FRAME], // the previous input frame, unprocessed
+    raw: [f32; FRAME],  // the frame before that: the dry signal, aligned with `den`
+    den: [f32; FRAME],  // RNNoise's latest output, which belongs to the same frame as `raw`
     k: usize,
     amount: Smooth,
     pub last_vad: f32,
@@ -20,7 +25,16 @@ pub struct Denoise {
 
 impl Denoise {
     pub fn new() -> Self {
-        Self { st: DenoiseState::new(), inbuf: [0.0; FRAME], raw: [0.0; FRAME], den: [0.0; FRAME], k: 0, amount: Smooth::new(1.0), last_vad: 0.0 }
+        Self {
+            st: DenoiseState::new(),
+            inbuf: [0.0; FRAME],
+            prev: [0.0; FRAME],
+            raw: [0.0; FRAME],
+            den: [0.0; FRAME],
+            k: 0,
+            amount: Smooth::new(1.0),
+            last_vad: 0.0,
+        }
     }
 }
 
@@ -37,7 +51,8 @@ impl Effect for Denoise {
             self.k += 1;
             if self.k == FRAME {
                 self.k = 0;
-                self.raw = self.inbuf;
+                self.raw = self.prev;
+                self.prev = self.inbuf;
                 self.last_vad = self.st.process_frame(&mut self.den, &self.inbuf);
             }
         }
@@ -45,13 +60,14 @@ impl Effect for Denoise {
     fn reset(&mut self) {
         self.st = DenoiseState::new();
         self.inbuf = [0.0; FRAME];
+        self.prev = [0.0; FRAME];
         self.raw = [0.0; FRAME];
         self.den = [0.0; FRAME];
         self.k = 0;
         self.amount.snap();
     }
     fn latency(&self) -> usize {
-        FRAME
+        LATENCY
     }
 }
 

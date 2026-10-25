@@ -165,14 +165,30 @@ fn live_chain_swap_crossfades_and_returns_old_chain() {
 #[test]
 fn denoise_keeps_alignment_and_reduces_noise() {
     let mut d = create("denoise").unwrap();
-    d.set(0, 0.0); // amount 0 → exactly the input, delayed by one frame
+    d.set(0, 0.0); // amount 0 → exactly the input, delayed by the declared latency
     d.reset();
     let src = tone(4800, 300.0, 0.3);
     let mut y = src.clone();
     run(d.as_mut(), &mut y);
     let lat = d.latency();
-    assert_eq!(lat, 480);
+    assert_eq!(lat, 960);
     assert!((lat..y.len()).all(|i| (y[i] - src[i - lat]).abs() < 1e-6));
+
+    // The denoised path must line up with the dry one, or partial amounts comb-filter and
+    // everything timed off `latency()` (voice gate, A/B recorder) is off by a frame.
+    let mut d = create("denoise").unwrap();
+    let mut ph = 0.0f32;
+    let voiced: Vec<f32> = (0..48_000)
+        .map(|i| {
+            ph += std::f32::consts::TAU * (140.0 + 30.0 * (i as f32 / 9000.0).sin()) / SR;
+            (1..12).map(|h| (ph * h as f32).sin() / h as f32).sum::<f32>() * 0.1
+        })
+        .collect();
+    let mut y = voiced.clone();
+    run(d.as_mut(), &mut y);
+    let xcorr = |lag: usize| -> f32 { (24_000..47_000).map(|i| y[i] * voiced[i - lag]).sum() };
+    let best = (0..1500).max_by(|&a, &b| xcorr(a).total_cmp(&xcorr(b))).unwrap();
+    assert!(best.abs_diff(lat) <= 4, "denoised output lags {best} samples, latency() says {lat}");
 
     let mut d = create("denoise").unwrap();
     let mut rng = 7u32;
