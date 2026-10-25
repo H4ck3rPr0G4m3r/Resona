@@ -114,6 +114,32 @@ export interface CalibrationResult {
   results: { block_ms: number; p50_ms: number; p99_ms: number; ok: boolean }[];
   recommended: number;
   budget: number;
+  gpu: string;
+}
+
+export interface LibraryVoice {
+  id: string;
+  name: string;
+  model_file: string;
+  index_file: string | null;
+  path: string;
+  index_path: string | null;
+  source: string;
+  info: ModelInfo;
+  favorite: boolean;
+  hotkey: string | null;
+  added_at: number;
+}
+
+export interface ImportReport {
+  added: LibraryVoice[];
+  skipped: { path: string; reason: string }[];
+  failed: { path: string; error: string }[];
+}
+
+export interface Binding {
+  accel: string;
+  action: string;
 }
 
 export type RuntimeEvent =
@@ -133,12 +159,33 @@ export const api = {
   inspectModel: (path: string) => invoke<ModelInfo>("inspect_model", { path }),
   calibrate: (voice: VoiceRef, stream?: Partial<StreamSettings>) =>
     invoke<CalibrationResult>("calibrate", { voice, stream: stream ?? null }),
-  activateVoice: (voice: VoiceRef) => invoke<void>("activate_voice", { voice }),
+  activateVoice: (voice: VoiceRef, params?: Partial<LiveParams>, xfadeMs?: number) =>
+    invoke<void>("activate_voice", { voice, params: params ?? null, xfadeMs: xfadeMs ?? null }),
   preloadVoice: (voice: VoiceRef) => invoke<ModelInfo>("preload_voice", { voice }),
   setMuted: (muted: boolean) => invoke<void>("set_muted", { muted }),
+  getMuted: () => invoke<boolean>("get_muted"),
   setOutputGain: (db: number) => invoke<void>("set_output_gain", { db }),
   setMonitorGain: (db: number) => invoke<void>("set_monitor_gain", { db }),
   engineLog: (lines = 50) => invoke<string[]>("engine_log", { lines }),
+  assetsStatus: () => invoke<{ root: string; missing: string[] }>("assets_status"),
+  settingsLoad: () => invoke<Record<string, unknown>>("settings_load"),
+  settingsSave: (settings: unknown) => invoke<void>("settings_save", { settings }),
+  profileLoad: (hash: string) => invoke<Record<string, unknown> | null>("profile_load", { hash }),
+  profileSave: (hash: string, profile: unknown) => invoke<void>("profile_save", { hash, profile }),
+  libraryList: () => invoke<LibraryVoice[]>("library_list"),
+  libraryUpdate: (id: string, patch: Partial<Pick<LibraryVoice, "favorite" | "hotkey" | "name">>) =>
+    invoke<LibraryVoice>("library_update", { id, patch }),
+  libraryRemove: (id: string) => invoke<void>("library_remove", { id }),
+  libraryImport: (paths: string[]) => invoke<ImportReport>("library_import", { paths }),
+  applyHotkeys: (bindings: Binding[]) =>
+    invoke<{ accel: string; action: string; error: string }[]>("apply_hotkeys", { bindings }),
+  setShellPrefs: (closeToTray: boolean, autostart: boolean) =>
+    invoke<void>("set_shell_prefs", { closeToTray, autostart }),
+  launchedMinimized: () => invoke<boolean>("launched_minimized"),
   onEvent: (cb: (e: RuntimeEvent) => void): Promise<UnlistenFn> =>
     listen<RuntimeEvent>("resona", (e) => cb(e.payload)),
+  onImport: (cb: (p: { done: number; total: number; name: string | null }) => void) =>
+    listen<{ done: number; total: number; name: string | null }>("import", (e) => cb(e.payload)),
+  onMuted: (cb: (muted: boolean) => void) => listen<{ muted: boolean }>("muted", (e) => cb(e.payload.muted)),
+  onHotkey: (cb: (action: string) => void) => listen<{ action: string }>("hotkey", (e) => cb(e.payload.action)),
 };

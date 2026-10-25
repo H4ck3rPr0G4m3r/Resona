@@ -1,98 +1,157 @@
 <script lang="ts">
-  // M2 functional shell — replaced by the full UI in M4.
   import { onMount } from "svelte";
-  import { open } from "@tauri-apps/plugin-dialog";
-  import { api, type DeviceInfo, type EngineState, type Stats } from "./lib/api";
+  import { fade } from "svelte/transition";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import DownloadSimple from "phosphor-svelte/lib/DownloadSimple";
+  import X from "phosphor-svelte/lib/X";
+  import TopBar from "./components/TopBar.svelte";
+  import Library from "./components/Library.svelte";
+  import LiveView from "./components/LiveView.svelte";
+  import Routing from "./components/Routing.svelte";
+  import SettingsDrawer from "./components/SettingsDrawer.svelte";
+  import { store } from "./lib/store.svelte";
 
-  let inputs = $state<DeviceInfo[]>([]);
-  let outputs = $state<DeviceInfo[]>([]);
-  let input = $state("");
-  let output = $state("");
-  let model = $state("");
-  let index = $state("");
-  let pitch = $state(0);
-  let state = $state<EngineState>("stopped");
-  let message = $state<string | null>(null);
-  let stats = $state<Stats | null>(null);
-  let inLevel = $state(0);
-  let outLevel = $state(0);
+  let dragging = $state(false);
 
   onMount(() => {
-    api.listDevices().then((d) => {
-      inputs = d.inputs;
-      outputs = d.outputs;
-      input = d.inputs.find((x) => x.is_default)?.id ?? "";
-      output = d.outputs.find((x) => x.name.includes("Line 1"))?.id ?? d.outputs[0]?.id ?? "";
-    });
-    const un = api.onEvent((e) => {
-      if (e.type === "state") {
-        state = e.state;
-        message = e.message;
-      } else if (e.type === "stats") stats = e;
-      else if (e.type === "meters") {
-        inLevel = e.input_peak;
-        outLevel = e.output_peak;
+    store.init();
+    const un = getCurrentWebview().onDragDropEvent((e) => {
+      const t = e.payload.type;
+      if (t === "enter" || t === "over") dragging = true;
+      else if (t === "leave") dragging = false;
+      else if (t === "drop") {
+        dragging = false;
+        const paths = e.payload.paths.filter((p) => /\.(pth|index|zip)$/i.test(p) || !/\.[a-z0-9]{1,5}$/i.test(p));
+        if (paths.length) store.importPaths(paths);
+        else store.notify("error", "Drop .pth, .index or .zip files, or a folder.");
       }
     });
     return () => un.then((f) => f());
   });
-
-  async function pickModel() {
-    const p = await open({ filters: [{ name: "RVC model", extensions: ["pth"] }] });
-    if (typeof p === "string") model = p;
-  }
-  async function pickIndex() {
-    const p = await open({ filters: [{ name: "Index", extensions: ["index"] }] });
-    if (typeof p === "string") index = p;
-  }
-  async function start() {
-    message = null;
-    try {
-      await api.start({
-        input: { device_id: input || null, mode: "shared" },
-        output: { device_id: output || null, mode: "shared" },
-        monitor: null,
-        stream: {},
-        voice: { id: model, path: model, index_path: index || null },
-        params: { pitch },
-        jitter_ms: 10,
-        down_mode: "mute",
-      });
-    } catch (e) {
-      message = String(e);
-    }
-  }
 </script>
 
-<main>
-  <h1>Resona <small>M2 shell</small></h1>
-  <label>Input <select bind:value={input}>{#each inputs as d}<option value={d.id}>{d.name}</option>{/each}</select></label>
-  <label>Output <select bind:value={output}>{#each outputs as d}<option value={d.id}>{d.name}</option>{/each}</select></label>
-  <label>Model <button onclick={pickModel}>Choose .pth</button> <code>{model || "—"}</code></label>
-  <label>Index <button onclick={pickIndex}>Choose .index</button> <code>{index || "—"}</code></label>
-  <label>Pitch {pitch}
-    <input type="range" min="-24" max="24" step="1" bind:value={pitch} onchange={() => state === "running" && api.setParams({ pitch })} />
-  </label>
-  <div class="row">
-    <button disabled={!model || state === "starting" || state === "loading"} onclick={start}>Start</button>
-    <button onclick={() => api.stop()}>Stop</button>
-    <span class="state">{state}</span>
+<div class="app" class:loading={!store.ready}>
+  <TopBar />
+  <Library />
+  <main class="center">
+    {#if store.ready}<LiveView />{:else}<div class="skeleton" aria-hidden="true"><span></span><span></span><span></span></div>{/if}
+  </main>
+  <Routing />
+</div>
+
+{#if store.settingsOpen}<SettingsDrawer />{/if}
+
+{#if dragging}
+  <div class="drop" transition:fade={{ duration: 120 }}>
+    <div class="drop-box">
+      <DownloadSimple size={28} />
+      <strong>Drop to add voices</strong>
+      <span>Models, indexes, zips or whole folders. Files are copied into the library.</span>
+    </div>
   </div>
-  {#if message}<pre class="msg">{message}</pre>{/if}
-  <div class="meters"><div style:width="{Math.min(inLevel, 1) * 100}%"></div></div>
-  <div class="meters"><div style:width="{Math.min(outLevel, 1) * 100}%"></div></div>
-  {#if stats}
-    <pre>{JSON.stringify({ p50: stats.p50_ms, p99: stats.p99_ms, latency: stats.latency?.total_ms, underruns: stats.underruns, ncc: stats.sola_ncc }, null, 1)}</pre>
-  {/if}
-</main>
+{/if}
+
+<div class="toasts" aria-live="polite">
+  {#each store.notices as n (n.id)}
+    <div class="toast {n.kind}" transition:fade={{ duration: 140 }}>
+      <span>{n.text}</span>
+      <button class="btn ghost icon" aria-label="Dismiss" onclick={() => store.dismiss(n.id)}><X size={13} /></button>
+    </div>
+  {/each}
+</div>
 
 <style>
-  :global(body) { margin: 0; background: #0e1012; color: #d9d6cf; font: 14px/1.4 system-ui, sans-serif; }
-  main { padding: 24px; display: grid; gap: 12px; max-width: 760px; }
-  label { display: flex; gap: 8px; align-items: center; }
-  .row { display: flex; gap: 8px; align-items: center; }
-  .state { font-family: ui-monospace, monospace; color: #ffb040; }
-  .msg { color: #ff8a7a; white-space: pre-wrap; }
-  .meters { height: 6px; background: #1c1f22; }
-  .meters div { height: 100%; background: #ffb040; }
+  .app {
+    display: grid;
+    grid-template-columns: 272px minmax(0, 1fr);
+    grid-template-rows: 48px minmax(0, 1fr) 52px;
+    grid-template-areas:
+      "bar bar"
+      "rail center"
+      "rail route";
+    height: 100dvh;
+  }
+  .center {
+    grid-area: center;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+  }
+  .skeleton {
+    display: grid;
+    gap: 14px;
+    padding: 22px;
+  }
+  .skeleton span {
+    height: 26px;
+    width: 40%;
+    border-radius: var(--r-ctl);
+    background: var(--raised);
+  }
+  .skeleton span:nth-child(2) {
+    width: 70%;
+    height: 120px;
+  }
+  .skeleton span:nth-child(3) {
+    width: 100%;
+    height: 220px;
+  }
+  .drop {
+    position: fixed;
+    inset: 0;
+    z-index: var(--z-overlay);
+    display: grid;
+    place-items: center;
+    background: var(--scrim);
+  }
+  .drop-box {
+    display: grid;
+    justify-items: center;
+    gap: 6px;
+    padding: 36px 44px;
+    border: 2px dashed var(--accent);
+    border-radius: var(--r-panel);
+    background: var(--panel);
+    color: var(--text-2);
+    text-align: center;
+    max-width: 380px;
+  }
+  .drop-box :global(svg) {
+    color: var(--accent);
+  }
+  .drop-box strong {
+    color: var(--text);
+    font-size: 15px;
+  }
+  .toasts {
+    position: fixed;
+    right: 14px;
+    bottom: 64px;
+    z-index: var(--z-toast);
+    display: grid;
+    gap: 8px;
+    max-width: 380px;
+  }
+  .toast {
+    display: flex;
+    align-items: start;
+    gap: 8px;
+    padding: 9px 6px 9px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-panel);
+    background: var(--raised);
+    box-shadow: var(--shadow);
+    overflow-wrap: anywhere;
+  }
+  .toast.error {
+    border-color: color-mix(in srgb, var(--bad) 50%, var(--line));
+  }
+  .toast span {
+    padding-top: 5px;
+  }
+  @media (max-width: 1000px) {
+    .app {
+      grid-template-columns: 236px minmax(0, 1fr);
+    }
+  }
 </style>
