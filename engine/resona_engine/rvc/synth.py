@@ -7,6 +7,7 @@ excitation as an input.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 
@@ -16,8 +17,23 @@ import torch.nn.functional as F
 
 from . import attentions
 from .checkpoint import ModelInfo, load_state
+from .resample import OUT_SR, Resampler
 from .modules import LRELU_SLOPE, ResBlock1, ResBlock2, ResidualCouplingBlock, fold_weight_norm
 from .source import fixed_noise, PhaseContinuousSource
+
+@contextlib.contextmanager
+def skip_init():
+    """Make nn.init's in-place initializers no-ops while modules are constructed."""
+    names = ("kaiming_uniform_", "uniform_", "normal_", "xavier_uniform_", "zeros_", "ones_")
+    saved = {n: getattr(nn.init, n) for n in names}
+    for n in names:
+        setattr(nn.init, n, lambda t, *a, **k: t)
+    try:
+        yield
+    finally:
+        for n, f in saved.items():
+            setattr(nn.init, n, f)
+
 
 Z_NOISE_FRAMES = 1 << 14  # time-locked flow noise, ~164 s at 100 fps
 FLOW_CONTEXT = 24  # frames of left context the flow needs (4 couplings × ±6 receptive field)
@@ -101,12 +117,16 @@ class Synth(nn.Module):
         self.upp = self.dec.upp
         if self.upp * 100 != self.sr:
             raise ValueError(f"upsample product {self.upp} does not match {self.sr} Hz at 100 fps")
+        self.out_sr = OUT_SR
+        self.out_upp = OUT_SR // 100  # output samples per frame
+        self.resampler = Resampler(self.sr, OUT_SR)
 
     @classmethod
     def from_checkpoint(cls, path: str | Path, device="cuda", half: bool = True) -> "Synth":
         info, state = load_state(path)
         state = fold_weight_norm({k: v.float() for k, v in state.items()})
-        model = cls(info)
+        with skip_init():  # every weight comes from the checkpoint; random init is wasted time
+            model = cls(info)
         try:
             model.load_state_dict(state, strict=True)
         except RuntimeError as e:
@@ -117,6 +137,7 @@ class Synth(nn.Module):
             model.half()
             model.dec.m_source.float()  # excitation stays fp32
             model.z_noise = model.z_noise.float()
+            model.resampler.float()
         return model
 
     @property
@@ -142,7 +163,7 @@ class Synth(nn.Module):
         commit_phase: bool = True,
         sid: int = 0,
     ) -> torch.Tensor:
-        """Returns audio [dec_len * upp] float32 for window frames [dec_start, dec_start+dec_len)."""
+        """Returns OUT_SR audio [dec_len * out_upp] float32 for window frames [dec_start, dec_start+dec_len)."""
         noise, exc, g = self.prepare(phone.shape[1], f0, abs_frame0, dec_start, dec_len, commit_phase, sid)
         return self.core(phone, pitch, noise, exc, g, dec_start, dec_len)
 
@@ -163,7 +184,7 @@ class Synth(nn.Module):
         z = self.flow.reverse(z_p, x_mask, g)
         off = dec_start - flow_head
         z = z[:, :, off : off + dec_len]
-        return self.dec(z, exc, g)[0, 0].float()
+        return self.resampler(self.dec(z, exc, g)[0, 0].float())
 
     def reset(self) -> None:
         self.dec.m_source.reset()

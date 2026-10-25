@@ -8,6 +8,7 @@ comes from a fixed buffer indexed by absolute sample, so overlapping regions are
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -16,7 +17,9 @@ import torch.nn as nn
 NOISE_LEN = 1 << 20  # ~22 s at 48 kHz before the noise pattern repeats
 
 
+@functools.lru_cache(maxsize=8)
 def fixed_noise(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """Deterministic noise, generated once per process (every voice shares the same pattern)."""
     g = torch.Generator().manual_seed(seed)
     return torch.randn(shape, generator=g)
 

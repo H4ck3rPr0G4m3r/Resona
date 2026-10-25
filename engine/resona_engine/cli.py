@@ -52,8 +52,8 @@ def cmd_convert(args) -> int:
         print(f"blocks={len(times)} p50={tot[len(tot) // 2]:.1f}ms p99={tot[int(len(tot) * 0.99)]:.1f}ms")
     else:
         y = convert_offline(features, voice, x, p, args.f0)
-    save(args.output, y, voice.info.sr)
-    print(f"wrote {args.output} ({voice.info.sr} Hz, {len(y) / voice.info.sr:.2f}s)")
+    save(args.output, y, voice.synth.out_sr)
+    print(f"wrote {args.output} ({voice.synth.out_sr} Hz, {len(y) / voice.synth.out_sr:.2f}s)")
     return 0
 
 

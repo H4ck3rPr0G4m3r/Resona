@@ -27,8 +27,9 @@ class Graph:
         torch.cuda.current_stream().wait_stream(side)
         self.graph = torch.cuda.CUDAGraph()
         # A dedicated capture stream gives this graph its own cuBLAS workspace (keyed per stream);
-        # graphs captured on a shared stream race on it when replayed concurrently.
-        with torch.no_grad(), torch.cuda.graph(self.graph, stream=side):
+        # graphs captured on a shared stream race on it when replayed concurrently. Thread-local
+        # capture lets the stream thread keep running while a new voice is captured.
+        with torch.no_grad(), torch.cuda.graph(self.graph, stream=side, capture_error_mode="thread_local"):
             self.outputs = fn(*self.inputs)
 
     def __call__(self, *inputs: torch.Tensor):

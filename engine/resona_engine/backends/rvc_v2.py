@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from ..rvc.checkpoint import ModelInfo
 from ..rvc.contentvec import ContentVec
 from ..rvc.index import GpuIndex
 from ..rvc.rmvpe import RMVPE
+from ..rvc.resample import OUT_SR
 from ..rvc.synth import FLOW_CONTEXT, Synth
 from .base import LiveParams, StageTimes, StreamConfig, StreamLayout
 
@@ -122,10 +124,24 @@ class RVCv2Backend:
         self._side = torch.cuda.Stream(self.device) if self.use_graphs else None
 
     # -- configuration ---------------------------------------------------------------------
-    def set_voice(self, voice: Voice) -> None:
+    def set_voice(self, voice: Voice, xfade_ms: float = 0.0, old_params: LiveParams | None = None) -> None:
+        """Switch voices without touching the input timeline.
+
+        The layout is voice-independent (output is always OUT_SR), so streaming continues. With
+        `xfade_ms`, the next blocks render both voices and crossfade them (equal power, the voices
+        are uncorrelated) keyed by absolute output sample, so overlapping blocks agree.
+        """
+        old = self.voice
         self.voice = voice
-        if self.cfg:
-            self.configure(self.cfg)
+        if self.cfg is None:
+            return
+        self.prepare_voice(voice)
+        voice.synth.reset()
+        self._xfade = None
+        if old is not None and old is not voice and xfade_ms > 0 and self.n_in >= self.W:
+            next_frame0 = (self.n_in + self.B - self.W) // HOP_IN
+            start = (next_frame0 + self.C // HOP_IN) * self.hop_out + self.X + self.S
+            self._xfade = (old, old_params, start, max(int(xfade_ms * OUT_SR / 1000), 1))
 
     def forget(self, voice: Voice) -> None:
         """Release the captured graph of an evicted voice."""
@@ -139,31 +155,24 @@ class RVCv2Backend:
         self.C, self.B, self.L = ms(cfg.context_ms), ms(cfg.block_ms), ms(cfg.lookahead_ms)
         self.W = self.C + self.B + self.L
         self.T = self.W // HOP_IN
-        sr = self.voice.info.sr
-        msr = lambda v: v * sr // 1000  # noqa: E731
-        self.upp = self.voice.synth.upp
-        self.X, self.S = msr(cfg.crossfade_ms), msr(cfg.sola_search_ms)
-        self.Bo = msr(cfg.block_ms)
+        mso = lambda v: v * OUT_SR // 1000  # noqa: E731
+        self.hop_out = OUT_SR // 100
+        self.X, self.S = mso(cfg.crossfade_ms), mso(cfg.sola_search_ms)
+        self.Bo = mso(cfg.block_ms)
         self.out_len = self.Bo + self.X + self.S
         self.pad_f = cfg.dec_pad_ms // 10
         self.ext = cfg.edge_audio_ms // 10
         self.T_all = self.T + self.ext
-        self.region_start = self._region_start(sr, self.upp)
-        self.dec_first = self._dec_first(sr, self.upp)
+        # Output region (OUT_SR samples, window-relative) starts S/2 before the block start.
+        self.region_start = (self.C // HOP_IN) * self.hop_out - self.S // 2
+        self.dec_first = max(self.region_start // self.hop_out - self.pad_f, 0)
         self.layout = StreamLayout(
-            model_sr=sr, block_in=self.B, block_out=self.Bo, out_len=self.out_len,
+            model_sr=OUT_SR, block_in=self.B, block_out=self.Bo, out_len=self.out_len,
             crossfade=self.X, search=self.S, nominal_offset=self.S // 2,
         )
         self.reset()
         self._build_graphs()
         return self.layout
-
-    def _region_start(self, sr: int, upp: int) -> int:
-        """Model-rate sample (window-relative) where the returned region starts: S/2 before the block."""
-        return (self.C // HOP_IN) * upp - (self.cfg.sola_search_ms * sr // 1000) // 2
-
-    def _dec_first(self, sr: int, upp: int) -> int:
-        return max(self._region_start(sr, upp) // upp - self.pad_f, 0)
 
     # -- CUDA graphs -----------------------------------------------------------------------
     def _build_graphs(self) -> None:
@@ -184,28 +193,36 @@ class RVCv2Backend:
             self._g_rmvpe = graphs.Graph(fs.rmvpe.salience, [x])
         self.prepare_voice(self.voice)
 
-    def prepare_voice(self, voice: Voice) -> None:
-        """Capture the synth graph for `voice` at the current layout (no streaming state touched)."""
+    def prepare_voice(self, voice: Voice, lock=None) -> None:
+        """Capture the synth graph for `voice` at the current layout (no streaming state touched).
+
+        With `lock`, the capture runs outside it (only the cache insert is locked), so a stream
+        thread holding that lock between blocks is never stalled by a voice preload.
+        """
         if not self.use_graphs or self.cfg is None or id(voice.synth) in self._g_synth:
             return
         synth, dev = voice.synth, self.device
         dtype = self.features.contentvec.model.dtype
-        d0 = self._dec_first(voice.info.sr, synth.upp)
+        d0, T_all = self.dec_first, self.T_all
         flow_head = max(d0 - FLOW_CONTEXT, 0)
-        dec_len = self.T_all - d0
+        dec_len = T_all - d0
         inter = synth.z_noise.shape[0]
         ex = [
-            torch.zeros(1, self.T_all, 768, device=dev, dtype=dtype),
-            torch.ones(1, self.T_all, device=dev, dtype=torch.long),
-            torch.zeros(1, inter, self.T_all - flow_head, device=dev, dtype=synth.emb_g.weight.dtype),
+            torch.zeros(1, T_all, 768, device=dev, dtype=dtype),
+            torch.ones(1, T_all, device=dev, dtype=torch.long),
+            torch.zeros(1, inter, T_all - flow_head, device=dev, dtype=synth.emb_g.weight.dtype),
             torch.zeros(1, 1, dec_len * synth.upp, device=dev),
             synth.speaker(0),
         ]
-        self._g_synth[id(synth)] = graphs.Graph(lambda *a: synth.core(*a, d0, dec_len), ex)
+        graph = graphs.Graph(lambda *a: synth.core(*a, d0, dec_len), ex)
+        with lock if lock is not None else contextlib.nullcontext():
+            if (T_all, d0) == (self.T_all, self.dec_first):  # layout unchanged meanwhile
+                self._g_synth[id(synth)] = graph
 
     def reset(self) -> None:
         self.buf = torch.zeros(self.W if self.cfg else 0, device=self.device)
         self.n_in = 0
+        self._xfade = None
         self.f0post.reset()
         if self.voice:
             self.voice.synth.reset()
@@ -219,6 +236,7 @@ class RVCv2Backend:
         """
         self.buf = torch.cat([self.buf[self.B :], x16k.to(self.device, torch.float32)])
         self.n_in += self.B
+        self._xfade = None
         self.f0post.reset()
         self.voice.synth.reset()
 
@@ -238,6 +256,22 @@ class RVCv2Backend:
             feats50 = g_content(xin) if g_content is not None else fs.content(xin, p.formant)
             f0 = fs.f0(xin, method, p.f0_threshold)
         return f0, feats50
+
+    def _render(self, voice: Voice, p: LiveParams, feats50, f0p, voiced, abs_frame0: int):
+        """Synthesize the output region for one voice. → (audio [out_len] OUT_SR, shifted f0)."""
+        f0s = f0p * (2.0 ** (p.pitch / 12.0))
+        phone = build_phone(feats50, voice, voiced, p, self.T_all)
+        pitch = to_coarse(f0s).to(self.device).unsqueeze(0)
+        synth, d0 = voice.synth, self.dec_first
+        dec_len = self.T_all - d0
+        noise, exc, g = synth.prepare(self.T_all, f0s, abs_frame0, d0, dec_len, commit_phase=True)
+        graph = self._g_synth.get(id(synth))
+        if graph is not None:
+            wav = graph(phone, pitch, noise, exc, g)
+        else:
+            wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
+        off = self.region_start - d0 * self.hop_out
+        return wav[off : off + self.out_len].clone(), f0s
 
     def _sync(self):
         if self.profile and self.device.type == "cuda":
@@ -269,25 +303,20 @@ class RVCv2Backend:
         f0p = torch.from_numpy(f0_np).float().to(self.device)
         if ext:
             f0p = torch.cat([f0p, torch.flip(f0p[-ext:], [0])])
-        f0s = f0p * (2.0 ** (p.pitch / 12.0))
         t2 = self._sync()
 
         voiced = f0p > 0
-        phone = build_phone(feats50, self.voice, voiced, p, T + ext)
-        pitch = to_coarse(f0s).to(self.device).unsqueeze(0)
-        T_all = phone.shape[1]
-
-        # Region (model-rate samples, window-relative): starts S/2 before the block start.
-        synth, d0 = self.voice.synth, self.dec_first
-        dec_len = T_all - d0
-        noise, exc, g = synth.prepare(T_all, f0s, abs_frame0, d0, dec_len, commit_phase=True)
-        graph = self._g_synth.get(id(synth))
-        if graph is not None:
-            wav = graph(phone, pitch, noise, exc, g)
-        else:
-            wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
-        off = self.region_start - d0 * self.upp
-        out = wav[off : off + self.out_len].clone()
+        out, f0s = self._render(self.voice, p, feats50, f0p, voiced, abs_frame0)
+        if self._xfade is not None:
+            old, old_p, start, n = self._xfade
+            region0 = abs_frame0 * self.hop_out + self.region_start
+            if region0 >= start + n:
+                self._xfade = None
+            else:
+                prev, _ = self._render(old, old_p or p, feats50, f0p, voiced, abs_frame0)
+                idx = torch.arange(self.out_len, device=self.device) + region0
+                w = ((idx - start).float() / n).clamp(0, 1) * (math.pi / 2)
+                out = prev * torch.cos(w) + out * torch.sin(w)
         commit_upto = abs_frame0 + (self.C + self.B) // HOP_IN
         self.f0post.commit(commit_upto)
         t3 = self._sync()

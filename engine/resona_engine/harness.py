@@ -84,7 +84,7 @@ def seam_summary(seams: list[tuple[float, float, float]]) -> dict:
 
 def run_harness(features: FeatureStack, voice: Voice, clips: list[Path], p: LiveParams,
                 cfg: StreamConfig, out_dir: Path | None = None) -> dict:
-    sr = voice.info.sr
+    sr = voice.synth.out_sr
     results = {}
     for clip in clips:
         x = load_mono(clip, 16000)

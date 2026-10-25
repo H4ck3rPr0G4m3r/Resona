@@ -30,7 +30,7 @@ def voice():
 def test_streaming_block_shapes(features, voice):
     be = RVCv2Backend(features, voice)
     lay = be.configure(StreamConfig())
-    assert lay.block_in == 960 and lay.block_out == 60 * voice.info.sr // 1000
+    assert lay.model_sr == 48000 and lay.block_in == 960 and lay.block_out == 60 * 48
     out = be.process(torch.zeros(lay.block_in), LiveParams())
     assert out.shape == (lay.out_len,)
 
@@ -71,7 +71,7 @@ def test_invalid_stream_config():
 def test_streaming_output_length_and_seams(features, voice, method):
     x = load_mono(CLIPS / "speech.wav", 16000)[: 16000 * 3]
     res = convert_streaming(features, voice, x, LiveParams(), StreamConfig(f0_method=method))
-    assert abs(len(res.audio) - len(x) * voice.info.sr / 16000) <= 1
+    assert abs(len(res.audio) - len(x) * 48000 / 16000) <= 1
     assert np.isfinite(res.audio).all()
     s = seam_summary(res.seams)
     assert s["seam_ncc"] > 0.8, s  # regression guard (naive RVC streaming scores ~0.78)
@@ -117,3 +117,33 @@ def test_voice_switch_reuses_feature_graphs(features, voice):
     assert torch.isfinite(out).all()
     be.forget(other)
     assert len(be._g_synth) == 1
+
+
+def test_seamless_switch_across_sample_rates(features, voice):
+    """Mid-stream switch 40k -> other-rate voice: same layout, crossfade, no clicks at the seam."""
+    from resona_engine.pipeline.sola import Sola
+
+    from resona_engine.rvc.checkpoint import inspect
+
+    other_pth = next(p for p in reference_models() if index_for(p) and inspect(p).sr != voice.info.sr)
+    other = Voice.load(other_pth, index_for(other_pth), torch.device("cuda"))
+    x = load_mono(CLIPS / "speech.wav", 16000)[: 16000 * 4]
+    be = RVCv2Backend(features, voice)
+    lay = be.configure(StreamConfig())
+    be.prepare_voice(other)
+    sola = Sola(lay.crossfade, lay.search)
+    p = LiveParams()
+    outs, switch_at = [], 30
+    for k, i in enumerate(range(0, len(x) - lay.block_in + 1, lay.block_in)):
+        if k == switch_at:
+            be.set_voice(other, xfade_ms=50, old_params=p)
+            assert be.layout == lay and be._xfade is not None
+        outs.append(sola.process(be.process(torch.from_numpy(x[i : i + lay.block_in]), p).cpu().numpy(), lay.block_out))
+        if k == switch_at + 3:
+            assert be._xfade is None  # fade finished within a few blocks
+    y = np.concatenate(outs)
+    assert np.isfinite(y).all()
+    jump = np.abs(np.diff(y))
+    seam = slice(switch_at * lay.block_out - 960, (switch_at + 2) * lay.block_out + 960)
+    outside = np.concatenate([jump[: seam.start], jump[seam.stop :]])
+    assert jump[seam].max() < 1.25 * outside.max(), (jump[seam].max(), outside.max())  # a click would be far larger

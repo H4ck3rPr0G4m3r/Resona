@@ -27,6 +27,7 @@ PROTOCOL = 1
 MAX_BACKLOG = 2  # blocks; older input is skipped to catch up
 STATS_INTERVAL = 0.1
 VOICE_CACHE = 3  # voices kept resident in VRAM
+XFADE_MS = 50.0  # voice-switch crossfade
 
 
 def log(*a) -> None:
@@ -168,7 +169,7 @@ class Engine:
 
         @m("model.activate")
         def model_activate(p):
-            return self.activate(p["id"])
+            return self.activate(p["id"], p.get("params"), float(p.get("xfade_ms", XFADE_MS)))
 
         @m("model.unload")
         def model_unload(p):
@@ -220,6 +221,12 @@ class Engine:
         from .rvc.checkpoint import CheckpointError
 
         self._ensure_features()
+        cached = self.voices.get(vid)
+        if cached is not None and str(cached.info.path) == str(Path(path)):
+            info = cached.info.to_dict()  # already resident (switching back to a recent voice)
+            info["has_index"] = cached.index is not None
+            info["index_size"] = cached.index.size if cached.index is not None else 0
+            return info
         t = time.perf_counter()
         try:
             voice = Voice.load(path, index_path, self.features.device, self.features.half)
@@ -236,16 +243,22 @@ class Engine:
                     break
                 self.voice_order.remove(old)
                 self._forget(self.voices.pop(old, None))
-            if self.backend is not None and self.cfg is not None:
-                self.backend.prepare_voice(voice)  # capture now so activation is seamless
-        self._torch().cuda.empty_cache()
+        if self.backend is not None and self.cfg is not None:
+            # Capture now so activation is seamless; outside the lock so streaming continues.
+            self.backend.prepare_voice(voice, lock=self.lock)
+        if not self.running.is_set():
+            self._torch().cuda.empty_cache()
         log(f"voice {vid} loaded in {time.perf_counter() - t:.2f}s ({voice.info.name}, {voice.info.sr} Hz)")
         info = voice.info.to_dict()
         info["has_index"] = voice.index is not None
         info["index_size"] = voice.index.size if voice.index is not None else 0
         return info
 
-    def activate(self, vid: str) -> dict:
+    def activate(self, vid: str, params: dict | None = None, xfade_ms: float = 0.0) -> dict:
+        """Make `vid` the active voice. While streaming this is seamless: same layout (output is
+        always 48 kHz), input history kept, and old -> new voice crossfaded over `xfade_ms`."""
+        from .backends.base import LiveParams
+
         with self.lock:
             if self.stub:
                 self.active = vid
@@ -255,13 +268,15 @@ class Engine:
                 raise RpcError(f"voice {vid!r} is not loaded", -32011)
             from .backends.rvc_v2 import RVCv2Backend
 
+            old_params = self.params
+            if params is not None:
+                self.params = LiveParams.from_dict(params, self.params)
             if self.backend is None:
                 self.backend = RVCv2Backend(self._ensure_features(), voice)
             else:
-                self.backend.voice = voice
+                streaming = self.running.is_set()
+                self.backend.set_voice(voice, xfade_ms if streaming else 0.0, old_params)
             self.active = vid
-            if self.cfg is not None:
-                self.layout = self.backend.configure(self.cfg)
             return {"active": vid, "layout": self.layout.to_dict() if self.layout else None}
 
     def configure(self, cfg_dict: dict) -> dict:
@@ -338,7 +353,8 @@ class Engine:
                     self._prepare_cached()
             ok = [r["block_ms"] for r in results if r["ok"]]
             rec = min(ok) if ok else max((r["block_ms"] for r in results), default=base.block_ms)
-            return {"results": results, "recommended": rec, "budget": budget}
+            gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+            return {"results": results, "recommended": rec, "budget": budget, "gpu": gpu}
 
     def _warmup(self, n: int = 3) -> None:
         if self.stub:

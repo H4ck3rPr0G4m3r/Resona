@@ -405,7 +405,7 @@ impl DspThread {
         self.sola = Sola::new(layout.crossfade, layout.search);
         self.rs = Self::new_resampler(&layout);
         self.block = vec![0.0; layout.block_out];
-        self.up = vec![0.0; self.rs.max_out(layout.block_out)];
+        self.up = vec![0.0; self.rs.max_out(layout.block_out).max(layout.block_out)];
         self.primed = false;
     }
 
@@ -459,7 +459,13 @@ impl DspThread {
                 }
                 self.sola.process(&self.y[..h.n], self.layout.block_out, &mut self.block);
                 self.shared.sola_ncc.store(self.sola.last_ncc);
-                let n = self.rs.process(&self.block, &mut self.up);
+                let n = if self.layout.model_sr as usize == RATE {
+                    // The engine already delivers 48 kHz (all voices do since M4).
+                    self.up[..self.block.len()].copy_from_slice(&self.block);
+                    self.block.len()
+                } else {
+                    self.rs.process(&self.block, &mut self.up)
+                };
                 self.push_out(n, false);
                 out_meter.process(&self.up[..n], &self.shared.out_meter);
             }
@@ -533,7 +539,7 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         shared: shared.clone(),
     };
     let rs = DspThread::new_resampler(&layout);
-    let up = vec![0.0; rs.max_out(layout.block_out)];
+    let up = vec![0.0; rs.max_out(layout.block_out).max(layout.block_out)];
     let dsp = DspThread {
         transport,
         shared,

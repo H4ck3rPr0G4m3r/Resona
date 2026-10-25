@@ -3,6 +3,7 @@
 //!
 //! cargo run -p resona-runtime --example live -- <model.pth> [index] [seconds] [--kill-at N] [--out "Line 1"]
 //!     [--block 60 | --block auto]   (auto = run the engine calibration first)
+//!     [--switch-at N --switch-to other.pth]   (seamless voice switch while live)
 
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ fn main() {
     let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let kill_at: Option<u64> = flag("--kill-at").and_then(|s| s.parse().ok());
+    let switch_at: Option<u64> = flag("--switch-at").and_then(|s| s.parse().ok());
+    let switch_to = flag("--switch-to");
     let out_name = flag("--out").unwrap_or_else(|| "Line 1".into());
     let out_mode = flag("--out-mode").unwrap_or_else(|| "shared".into());
     let out_id = list_devices(Direction::Render).unwrap().into_iter().find(|d| d.name.contains(&out_name)).map(|d| d.id);
@@ -65,8 +68,18 @@ fn main() {
     println!("started in {:.1}s", t0.elapsed().as_secs_f32());
     let t1 = Instant::now();
     let mut killed = false;
+    let mut switched = false;
     while t1.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_millis(250));
+        if let (Some(at), Some(path)) = (switch_at, switch_to.as_ref()) {
+            if !switched && t1.elapsed() >= Duration::from_secs(at) {
+                switched = true;
+                let v: resona_runtime::VoiceRef = serde_json::from_value(json!({"id": "v2", "path": path})).unwrap();
+                let t = Instant::now();
+                rt.activate_voice(&v, json!({"pitch": 0}), 50.0).expect("switch");
+                println!(">>> switched voice in {:.2}s (load + activate)", t.elapsed().as_secs_f32());
+            }
+        }
         if let Some(k) = kill_at {
             if !killed && t1.elapsed() >= Duration::from_secs(k) {
                 println!(">>> killing engine worker");

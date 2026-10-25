@@ -17,7 +17,7 @@ def test_load_all_reference_models(pth, device):
     pitch = torch.full((1, t), 60, dtype=torch.long, device=device)
     f0 = torch.full((t,), 200.0, device=device)
     wav = synth.infer(phone, pitch, f0, abs_frame0=0, dec_start=40, dec_len=12)
-    assert wav.shape == (12 * synth.upp,)
+    assert wav.shape == (12 * synth.out_upp,)
     assert torch.isfinite(wav).all()
     assert wav.abs().max() <= 1.0
 

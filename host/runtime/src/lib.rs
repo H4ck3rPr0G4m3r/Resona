@@ -465,13 +465,24 @@ impl Runtime {
     }
 
     /// Switch the active voice of a running session.
-    pub fn activate_voice(&self, voice: &VoiceRef) -> Result<()> {
+    /// Switch the active voice (and optionally its profile params). While running this is
+    /// seamless: the engine crossfades old -> new over `xfade_ms` without a layout change.
+    pub fn activate_voice(&self, voice: &VoiceRef, params: Value, xfade_ms: f32) -> Result<()> {
         let _guard = self.inner.control.lock();
         self.preload_voice(voice)?;
-        let res = self.call("model.activate", json!({"id": voice.id}), T_SLOW)?;
+        let mut req = json!({"id": voice.id, "xfade_ms": xfade_ms});
+        if !params.is_null() {
+            req["params"] = params.clone();
+        }
+        let res = self.call("model.activate", req, T_SLOW)?;
+        if let Some(s) = self.inner.session.lock().as_mut() {
+            s.cfg.voice = voice.clone();
+            if !params.is_null() {
+                s.cfg.params = params;
+            }
+        }
         if let Some(layout) = res.get("layout").cloned().and_then(|l| serde_json::from_value::<Layout>(l).ok()) {
             if let Some(s) = self.inner.session.lock().as_mut() {
-                s.cfg.voice = voice.clone();
                 if layout != s.layout {
                     if let Some(p) = &s.pipeline {
                         let _ = p.cmds.send(DspCmd::Layout(layout));

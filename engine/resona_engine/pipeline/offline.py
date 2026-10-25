@@ -25,7 +25,7 @@ class StreamResult:
 @torch.no_grad()
 def convert_offline(features: FeatureStack, voice: Voice, wav16k: np.ndarray, p: LiveParams,
                     f0_method: str = "rmvpe") -> np.ndarray:
-    """Convert a whole 16 kHz clip in one pass (infinite context). Returns model-rate audio."""
+    """Convert a whole 16 kHz clip in one pass (infinite context). Returns OUT_SR audio."""
     n = wav16k.shape[0]
     x = np.pad(wav16k.astype(np.float32), (PAD, PAD), mode="reflect")
     x = np.pad(x, (0, (-x.shape[0]) % 320))
@@ -40,9 +40,8 @@ def convert_offline(features: FeatureStack, voice: Voice, wav16k: np.ndarray, p:
     pitch = to_coarse(f0s).to(features.device).unsqueeze(0)
     voice.synth.reset()
     wav = voice.synth.infer(phone, pitch, f0s, -PAD // HOP_IN, 0, T, commit_phase=False)
-    upp = voice.synth.upp
-    start = PAD // HOP_IN * upp
-    out_len = int(round(n * voice.info.sr / 16000))
+    start = PAD // HOP_IN * voice.synth.out_upp
+    out_len = int(round(n * voice.synth.out_sr / 16000))
     return wav[start : start + out_len].cpu().numpy()
 
 
@@ -50,7 +49,7 @@ def convert_streaming(features: FeatureStack, voice: Voice, wav16k: np.ndarray, 
                       cfg: StreamConfig, profile: bool = False):
     """Simulate the real-time path block by block (engine + host SOLA).
 
-    Returns audio aligned to the input timeline (model rate), per-block StageTimes, and per-seam
+    Returns audio aligned to the input timeline (OUT_SR), per-block StageTimes, and per-seam
     SOLA consistency stats.
     """
     backend = RVCv2Backend(features, voice)
