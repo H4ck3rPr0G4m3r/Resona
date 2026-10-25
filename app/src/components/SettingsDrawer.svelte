@@ -52,6 +52,8 @@
   let stream = $derived(s.stream);
   let xfadeMax = $derived(Math.max(0, (stream.lookahead_ms ?? 40) - (stream.sola_search_ms ?? 10) / 2));
   let cal = $derived(s.calibration);
+  let listen = $state("");
+  let st = $derived(store.selftest);
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -175,6 +177,50 @@
             </tbody>
           </table>
           <span class="hint">A block fits when its slowest 1 % stays under 60 % of the block length.</span>
+        {/if}
+      </section>
+      <section>
+        <div class="head">
+          <span class="title">Latency self-test</span>
+          <span class="hint">Sends five short test tones through the whole chain and times them on the way out. Your mic is muted for about 7 seconds.</span>
+        </div>
+        <div class="field">
+          <label class="label" for="st-listen">Listen on</label>
+          <select id="st-listen" class="input" bind:value={listen}>
+            <option value="">The output device (loopback)</option>
+            {#each store.inputs as d (d.id)}<option value={d.id}>{d.name}</option>{/each}
+          </select>
+          <span class="hint">To include the virtual cable's own buffering, pick its recording side (for VAC, the "Line" input).</span>
+        </div>
+        <div class="row">
+          <button class="btn" disabled={!store.running || store.selftest.running} onclick={() => store.runSelfTest(listen || null)}>
+            {store.selftest.running ? "Testing" : st.result ? "Test again" : "Run test"}
+          </button>
+          {#if !store.running}<span class="hint">Start the voice changer first.</span>{/if}
+        </div>
+        {#if store.selftest.running}
+          <div class="st-progress" aria-hidden="true"><span></span></div>
+        {:else if st.error}
+          <p class="st-error">{st.error}</p>
+        {:else if st.result}
+          {@const r = st.result}
+          {@const lo = Math.min(...r.runs_ms, r.estimate_ms ?? Infinity) - 10}
+          {@const hi = Math.max(...r.runs_ms, r.estimate_ms ?? 0) + 10}
+          {@const pos = (v: number) => `${((v - lo) / (hi - lo)) * 100}%`}
+          <div class="st-result">
+            <div class="st-figs">
+              <div><span class="num st-big">{Math.round(r.measured_ms)}</span><span class="st-unit">ms measured</span></div>
+              {#if r.estimate_ms !== null}
+                <div class="st-est"><span class="num">{Math.round(r.estimate_ms)} ms</span> estimated · <span class="num">{r.measured_ms - r.estimate_ms >= 0 ? "+" : ""}{Math.round(r.measured_ms - r.estimate_ms)}</span></div>
+              {/if}
+            </div>
+            <div class="st-scale" role="img" aria-label="Five measurements between {Math.round(Math.min(...r.runs_ms))} and {Math.round(Math.max(...r.runs_ms))} ms">
+              {#if r.estimate_ms !== null}<span class="st-mark est" style:left={pos(r.estimate_ms)} title="Estimate"></span>{/if}
+              {#each r.runs_ms as v, i (i)}<span class="st-mark run" style:left={pos(v)} title="{v.toFixed(1)} ms"></span>{/each}
+              <span class="st-mark med" style:left={pos(r.measured_ms)}></span>
+            </div>
+            <span class="hint">Spread <span class="num">{r.spread_ms.toFixed(1)} ms</span> across 5 tones, heard on {r.listen}.</span>
+          </div>
         {/if}
       </section>
       <section>
@@ -417,5 +463,92 @@
   }
   .cal tr.rec td {
     color: var(--accent);
+  }
+  .head {
+    display: grid;
+    gap: 2px;
+  }
+  .st-progress {
+    height: 3px;
+    border-radius: 2px;
+    background: var(--inset);
+    overflow: hidden;
+  }
+  .st-progress span {
+    display: block;
+    height: 100%;
+    width: 100%;
+    background: var(--accent);
+    transform-origin: left;
+    animation: st-fill 7.4s linear forwards;
+  }
+  @keyframes st-fill {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+  .st-error {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: var(--r-ctl);
+    background: color-mix(in srgb, var(--bad) 12%, transparent);
+    color: var(--text);
+    font-size: 12px;
+  }
+  .st-result {
+    display: grid;
+    gap: 10px;
+  }
+  .st-figs {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .st-big {
+    font-size: 30px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+  .st-unit {
+    margin-left: 6px;
+    color: var(--text-2);
+  }
+  .st-est {
+    color: var(--text-3);
+    font-size: 12px;
+  }
+  .st-scale {
+    position: relative;
+    height: 22px;
+    border-radius: var(--r-ctl);
+    background: var(--inset);
+    border: 1px solid var(--line);
+  }
+  .st-mark {
+    position: absolute;
+    top: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .st-mark.run {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  .st-mark.med {
+    width: 2px;
+    height: 16px;
+    background: var(--accent);
+  }
+  .st-mark.est {
+    width: 0;
+    height: 16px;
+    border-left: 2px dashed var(--text-3);
   }
 </style>

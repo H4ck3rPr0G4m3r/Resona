@@ -28,6 +28,9 @@ pub struct StreamConfig {
     pub device_id: Option<String>,
     #[serde(default)]
     pub mode: StreamMode,
+    /// Capture only: record what a *render* device (`device_id`) is playing (WASAPI loopback).
+    #[serde(default)]
+    pub loopback: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,13 +55,15 @@ const HNS_PER_MS: i64 = 10_000;
 const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn open(direction: Direction, cfg: &StreamConfig) -> Result<Opened> {
-    let device = open_device(direction, cfg.device_id.as_deref())?;
+    // Loopback opens the render endpoint and initializes it for capture (shared mode only).
+    let loopback = cfg.loopback && direction == Direction::Capture;
+    let device = open_device(if loopback { Direction::Render } else { direction }, cfg.device_id.as_deref())?;
     let device_name = device.get_friendlyname().unwrap_or_default();
     let wdir: wasapi::Direction = direction.into();
     let mix = device.get_iaudioclient()?.get_mixformat()?;
     let mix_fmt = SampleFormat::from_wave(&mix);
 
-    if cfg.mode == StreamMode::Exclusive {
+    if cfg.mode == StreamMode::Exclusive && !loopback {
         let mut client = device.get_iaudioclient()?;
         let channels = mix.get_nchannels() as usize;
         let candidates = [
@@ -85,7 +90,7 @@ fn open(direction: Direction, cfg: &StreamConfig) -> Result<Opened> {
         return Ok(Opened { client, event, fmt, channels, info });
     }
 
-    if cfg.mode == StreamMode::LowLatency && mix.get_samplespersec() == SAMPLE_RATE {
+    if cfg.mode == StreamMode::LowLatency && !loopback && mix.get_samplespersec() == SAMPLE_RATE {
         if let Some(fmt) = mix_fmt {
             let attempt = (|| -> Result<Opened> {
                 let mut client = device.get_iaudioclient()?;
@@ -132,7 +137,11 @@ fn open(direction: Direction, cfg: &StreamConfig) -> Result<Opened> {
     let period_frames = (default_period * SAMPLE_RATE as i64 / 10_000_000) as u32;
     let info = StreamInfo {
         device_name,
-        mode: if native { "shared".into() } else { "shared (converted)".into() },
+        mode: match (loopback, native) {
+            (true, _) => "loopback".into(),
+            (false, true) => "shared".into(),
+            (false, false) => "shared (converted)".into(),
+        },
         period_frames,
         buffer_frames: buffer,
         latency_ms: period_frames as f32 * 1000.0 / SAMPLE_RATE as f32,
@@ -225,6 +234,16 @@ impl CaptureStream {
         F: FnMut(&[f32]) + Send + 'static,
         E: FnOnce(String) + Send + 'static,
     {
+        Self::start_timed(cfg, move |x, _| on_data(x), on_error)
+    }
+
+    /// Like [`start`](Self::start), plus the QPC time (100 ns units) of each packet's first frame.
+    /// Times from different streams share one clock, so they can be compared directly.
+    pub fn start_timed<F, E>(cfg: StreamConfig, mut on_data: F, on_error: E) -> Result<Self>
+    where
+        F: FnMut(&[f32], u64) + Send + 'static,
+        E: FnOnce(String) + Send + 'static,
+    {
         let r = Running::spawn("resona-capture", Direction::Capture, cfg, move |o, stop| {
             let res = (|| -> std::result::Result<(), String> {
                 let capture = o.client.get_audiocaptureclient().map_err(|e| e.to_string())?;
@@ -258,7 +277,7 @@ impl CaptureStream {
                         } else {
                             to_mono(&bytes[..byte_len], o.fmt, o.channels, &mut mono[..frames]);
                         }
-                        on_data(&mono[..frames]);
+                        on_data(&mono[..frames], info.timestamp);
                     }
                 }
                 let _ = o.client.stop_stream();

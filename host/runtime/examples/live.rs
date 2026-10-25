@@ -69,8 +69,39 @@ fn main() {
     let t1 = Instant::now();
     let mut killed = false;
     let mut switched = false;
+    let selftest_at: Option<u64> = flag("--selftest-at").and_then(|s| s.parse().ok());
+    let listen = flag("--listen").map(|name| {
+        list_devices(Direction::Capture).unwrap().into_iter().find(|d| d.name.contains(&name)).expect("--listen device").id
+    });
+    let record_at: Option<u64> = flag("--record-at").and_then(|s| s.parse().ok());
+    let mut tested = false;
+    let mut recorded = false;
+    if let Some(file) = flag("--play") {
+        let st = rt.player_load(std::path::Path::new(&file)).expect("load sound file");
+        rt.player_set_loop(true);
+        rt.player_play(true);
+        println!(">>> playing {:?} ({:.1}s, looped) instead of the mic", st.name, st.duration_s);
+    }
     while t1.elapsed() < Duration::from_secs(secs) {
         std::thread::sleep(Duration::from_millis(250));
+        if let Some(at) = selftest_at {
+            if !tested && t1.elapsed() >= Duration::from_secs(at) {
+                tested = true;
+                match rt.latency_self_test(listen.clone()) {
+                    Ok(r) => println!(">>> self-test: {r:?}"),
+                    Err(e) => println!(">>> self-test failed: {e}"),
+                }
+            }
+        }
+        if let Some(at) = record_at {
+            if !recorded && t1.elapsed() >= Duration::from_secs(at) {
+                recorded = true;
+                let dir = std::env::temp_dir().join("resona-live-takes");
+                rt.record_start(dir, "live".into()).expect("record");
+                std::thread::sleep(Duration::from_secs(4));
+                println!(">>> take: {:?}", rt.record_stop());
+            }
+        }
         if let (Some(at), Some(path)) = (switch_at, switch_to.as_ref()) {
             if !switched && t1.elapsed() >= Duration::from_secs(at) {
                 switched = true;

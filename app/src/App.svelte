@@ -21,9 +21,7 @@
       else if (t === "leave") dragging = false;
       else if (t === "drop") {
         dragging = false;
-        const paths = e.payload.paths.filter((p) => /\.(pth|index|zip)$/i.test(p) || !/\.[a-z0-9]{1,5}$/i.test(p));
-        if (paths.length) store.importPaths(paths);
-        else store.notify("error", "Drop .pth, .index or .zip files, or a folder.");
+        store.drop(e.payload.paths);
       }
     });
     return () => un.then((f) => f());
@@ -46,7 +44,7 @@
     <div class="drop-box">
       <DownloadSimple size={28} />
       <strong>Drop to add voices</strong>
-      <span>Models, indexes, zips or whole folders. Files are copied into the library.</span>
+      <span>Models, indexes, zips or whole folders are copied into the library. Audio files (WAV, MP3, FLAC) play as the input.</span>
     </div>
   </div>
 {/if}
@@ -55,6 +53,10 @@
   {#each store.notices as n (n.id)}
     <div class="toast {n.kind}" transition:fade={{ duration: 140 }}>
       <span>{n.text}</span>
+      {#if n.action}
+        {@const act = n.action}
+        <button class="btn act" onclick={() => { act.run(); store.dismiss(n.id); }}>{act.label}</button>
+      {/if}
       <button class="btn ghost icon" aria-label="Dismiss" onclick={() => store.dismiss(n.id)}><X size={13} /></button>
     </div>
   {/each}
@@ -148,6 +150,13 @@
   }
   .toast span {
     padding-top: 5px;
+  }
+  .toast .act {
+    flex: none;
+    height: 26px;
+    margin-left: 4px;
+    color: var(--accent);
+    font-weight: 600;
   }
   @media (max-width: 1000px) {
     .app {

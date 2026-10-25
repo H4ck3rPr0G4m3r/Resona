@@ -9,7 +9,10 @@
 
 pub mod fx;
 pub mod pipeline;
+pub mod player;
+pub mod recorder;
 pub mod rpc;
+pub mod selftest;
 pub mod worker;
 
 use std::collections::VecDeque;
@@ -52,6 +55,8 @@ pub enum Event {
     Pitch { input: Vec<f32>, output: Vec<f32> },
     Progress { what: String, done: u64, total: u64 },
     Log { line: String },
+    /// A recording finished because the session stopped.
+    Take(recorder::Take),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +130,8 @@ struct Inner {
     restarts: Mutex<VecDeque<Instant>>,
     /// Serializes start/stop/recovery so they never interleave.
     control: Mutex<()>,
+    /// The latency bar's last total, for comparing with the self-test.
+    last_estimate_ms: Mutex<Option<f32>>,
 }
 
 #[derive(Clone)]
@@ -152,6 +159,7 @@ impl Runtime {
             state: Mutex::new((EngineState::Stopped, None)),
             restarts: Mutex::new(VecDeque::new()),
             control: Mutex::new(()),
+            last_estimate_ms: Mutex::new(None),
         });
         let rt = Self { inner };
         rt.spawn_meter_thread();
@@ -245,6 +253,8 @@ impl Runtime {
                 0 => sess.cfg.jitter_ms,
                 n => n as f32 / 48.0,
             };
+            let total_ms = input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms + 1.0;
+            *self.inner.last_estimate_ms.lock() = Some(total_ms);
             let latency = json!({
                 "input_ms": input_ms,
                 "block_ms": sess.layout.block_ms(),
@@ -253,7 +263,7 @@ impl Runtime {
                 "buffer_ms": jitter_ms,
                 "effects_ms": fx_ms,
                 "output_ms": output_ms + 1.0,
-                "total_ms": input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms + 1.0,
+                "total_ms": total_ms,
             });
             obj.insert("latency".into(), latency);
             obj.insert("underruns".into(), json!(s.underruns.load(Ordering::Relaxed)));
@@ -408,6 +418,13 @@ impl Runtime {
 
     fn stop_locked(&self) {
         self.inner.shared.engine_live.store(false, Ordering::Release);
+        if self.inner.shared.recorder.recording() {
+            // Finish the take while audio still flows, so the wet side catches up.
+            match self.inner.shared.recorder.stop() {
+                Ok(take) => (self.inner.emit)(Event::Take(take)),
+                Err(e) => log::warn!("recording: {e}"),
+            }
+        }
         let sess = self.inner.session.lock().take();
         if let Some(mut s) = sess {
             if let Some(mut p) = s.pipeline.take() {
@@ -531,6 +548,118 @@ impl Runtime {
     /// Fast path for dragging one control: no chain rebuild, no validation of the rest.
     pub fn set_fx_param(&self, chain: &str, slot: u64, key: &str, value: f32) -> Result<()> {
         self.inner.shared.fx.set_param(chain, slot, key, value).map_err(RuntimeError::Other)
+    }
+
+    // -- sound-file input ------------------------------------------------------------------
+
+    /// Decode a WAV/MP3/FLAC file and load it as the input source (paused).
+    pub fn player_load(&self, path: &std::path::Path) -> Result<player::PlayerState> {
+        let samples = player::decode(path).map_err(RuntimeError::Other)?;
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.inner.shared.player.load(name, samples);
+        Ok(self.inner.shared.player.state())
+    }
+
+    pub fn player_unload(&self) {
+        self.inner.shared.player.unload();
+    }
+
+    pub fn player_play(&self, on: bool) {
+        self.inner.shared.player.play(on);
+    }
+
+    pub fn player_seek(&self, seconds: f32) {
+        self.inner.shared.player.seek_seconds(seconds);
+    }
+
+    pub fn player_set_loop(&self, on: bool) {
+        self.inner.shared.player.looping.store(on, Ordering::Relaxed);
+    }
+
+    pub fn player_state(&self) -> player::PlayerState {
+        self.inner.shared.player.state()
+    }
+
+    // -- A/B recorder ---------------------------------------------------------------------
+
+    /// Start writing `<stem> dry.wav` + `<stem> wet.wav` into `dir` (needs a running session).
+    pub fn record_start(&self, dir: std::path::PathBuf, stem: String) -> Result<()> {
+        if self.inner.session.lock().as_ref().and_then(|s| s.pipeline.as_ref()).is_none() {
+            return Err(RuntimeError::Other("start the voice changer first".into()));
+        }
+        self.inner.shared.recorder.start(dir, stem).map_err(RuntimeError::Other)
+    }
+
+    pub fn record_stop(&self) -> Result<recorder::Take> {
+        self.inner.shared.recorder.stop().map_err(RuntimeError::Other)
+    }
+
+    /// Seconds recorded so far, or `None` when not recording.
+    pub fn recording(&self) -> Option<f32> {
+        let r = &self.inner.shared.recorder;
+        r.recording().then(|| r.elapsed_s())
+    }
+
+    // -- latency self-test ----------------------------------------------------------------
+
+    /// Measure the real delay from input to output with test bursts (about 6 s; the mic is
+    /// muted meanwhile). `listen`: a recording device to listen on; `None` = output loopback.
+    pub fn latency_self_test(&self, listen: Option<String>) -> Result<selftest::SelfTestResult> {
+        use selftest::{Capture, BURSTS, PERIOD};
+        let output = {
+            let sess = self.inner.session.lock();
+            let s = sess
+                .as_ref()
+                .filter(|s| s.pipeline.is_some())
+                .ok_or_else(|| RuntimeError::Other("start the voice changer first".into()))?;
+            s.cfg.output.clone()
+        };
+        if self.state().0 != EngineState::Running {
+            return Err(RuntimeError::Other("the voice changer is not running yet".into()));
+        }
+        let shared = &self.inner.shared;
+        if shared.selftest.active.load(Ordering::Acquire) {
+            return Err(RuntimeError::Other("a self-test is already running".into()));
+        }
+        let cfg = match &listen {
+            Some(id) => DeviceStreamConfig { device_id: Some(id.clone()), mode: StreamMode::Shared, loopback: false },
+            None => DeviceStreamConfig { device_id: output.device_id.clone(), mode: StreamMode::Shared, loopback: true },
+        };
+        let total = (BURSTS + 3) * PERIOD;
+        let cap = Arc::new(Mutex::new(Capture::with_capacity(total)));
+        let sink = cap.clone();
+        let stream = resona_audio_io::CaptureStream::start_timed(
+            cfg,
+            move |x, qpc| {
+                if let Some(mut c) = sink.try_lock() {
+                    c.push(x, qpc);
+                }
+            },
+            |e| log::warn!("self-test listen stream: {e}"),
+        )?;
+        let listen_name = stream.info().device_name.clone();
+        std::thread::sleep(Duration::from_millis(300));
+        shared.selftest.arm();
+        let deadline = Instant::now() + Duration::from_millis((BURSTS * 1000 + 3000) as u64);
+        while !shared.selftest.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        shared.selftest.active.store(false, Ordering::Release);
+        // The last burst is still on its way through the engine and buffers.
+        std::thread::sleep(Duration::from_millis(900));
+        stream.stop();
+        if !shared.selftest.done.load(Ordering::Acquire) {
+            return Err(RuntimeError::Other("the microphone stream stopped during the test".into()));
+        }
+        let bursts: Vec<u64> = shared.selftest.burst_qpc.iter().map(|t| t.load(Ordering::Relaxed)).collect();
+        if bursts.iter().any(|&q| q == 0) {
+            return Err(RuntimeError::Other("the input device gives no timestamps, so the self-test cannot run on it".into()));
+        }
+        let cap = cap.lock();
+        let runs = selftest::analyze(&cap, &bursts).map_err(RuntimeError::Other)?;
+        let estimate = *self.inner.last_estimate_ms.lock();
+        let listen = if listen.is_some() { listen_name } else { format!("{listen_name} (loopback)") };
+        Ok(selftest::summarize(runs, estimate, listen))
     }
 
     pub fn set_down_mode(&self, m: DownMode) {

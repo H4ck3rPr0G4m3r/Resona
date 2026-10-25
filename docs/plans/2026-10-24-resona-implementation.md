@@ -165,6 +165,15 @@ audio rings plus JSON-RPC.
 - 5.2 Effects: gain, gate, compressor, LPF/HPF, 5-band EQ, de-esser, reverb, chorus, lo-fi, limiter.
 - 5.3 Input chain: HPF, RNNoise (nnnoiseless), Silero VAD with delayed gate, singing mode.
 - 5.4 A/B recorder, sound-file input (symphonia), latency self-test.
+- Status (done): all of the above.
+  - Deviation: the voice gate uses RNNoise's VAD (already running for noise suppression) rather
+    than Silero. This avoids an ONNX runtime in the host, and the gate is still lookahead-aligned
+    (20 ms) on the capture timeline.
+  - A/B takes are sample-aligned. `tests/ab.rs` puts wet within ±2 samples of dry, through the
+    real pipeline, and a real RVC take shows 0 ms envelope lag.
+  - Self-test (RTX 3060 Ti, B = 40 ms, VAC): 144 ms measured (spread ~9 ms), meeting the M3 exit
+    target of ≤ 150 ms. The latency bar estimates 127 ms; the gap is device and driver buffering
+    that the estimate cannot see.
 
 ## M6 — Filters
 - 6.1 Expression language + TOML composite filters + primitives registry.

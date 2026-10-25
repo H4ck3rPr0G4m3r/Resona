@@ -81,6 +81,13 @@ function startLive() {
   }, 33);
 }
 
+let player = params.has("file")
+  ? { name: "speech-sample.wav", playing: true, looping: true, position_s: 3.4, duration_s: 9.2 }
+  : { name: null as string | null, playing: false, looping: false, position_s: 0, duration_s: 0 };
+setInterval(() => {
+  if (player.playing && player.name) player.position_s = (player.position_s + 0.2) % player.duration_s;
+}, 200);
+
 export function install() {
   mockWindows("main");
   mockIPC(
@@ -132,6 +139,21 @@ export function install() {
         case "stop_session": setState("stopped"); location.reload(); return null;
         case "calibrate":
           return new Promise((r) => setTimeout(() => r({ results: [40, 60, 80, 100].map((b) => ({ block_ms: b, p50_ms: 14.8, p99_ms: 17.1, ok: true })), recommended: 40, budget: 0.6, gpu: "NVIDIA GeForce RTX 3060 Ti" }), 1200));
+        case "player_state": return player;
+        case "player_load":
+          player = { name: String(a.path).split(/[\\/]/).pop()!, playing: false, looping: false, position_s: 0, duration_s: 9.2 };
+          return player;
+        case "player_unload": player = { ...player, name: null, playing: false }; return null;
+        case "player_control":
+          if (a.looping != null) player.looping = a.looping as boolean;
+          if (a.seekS != null) player.position_s = a.seekS as number;
+          if (a.playing != null) player.playing = a.playing as boolean;
+          return player;
+        case "record_start": return null;
+        case "record_stop": return { dry: "C:/Users/me/Music/Resona/take dry.wav", wet: "C:/Users/me/Music/Resona/take wet.wav", seconds: 7.4 };
+        case "reveal": return null;
+        case "latency_selftest":
+          return new Promise((r) => setTimeout(() => r({ measured_ms: 144.3, runs_ms: [144.3, 148.9, 140.1, 144.0, 145.2], spread_ms: 8.8, estimate_ms: 127.5, listen: "Line 1 (Virtual Audio Cable) (loopback)" }), 7000));
         default: return null;
       }
     },

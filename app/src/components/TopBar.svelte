@@ -44,6 +44,25 @@
 
   <div class="right">
     <button
+      class="rec"
+      class:on={store.recording !== null}
+      aria-pressed={store.recording !== null}
+      disabled={!store.running && store.recording === null}
+      title={store.recording !== null
+        ? "Stop and save the take"
+        : store.running
+          ? "Record an A/B take: your raw input and the converted output, sample-aligned, into Music\\Resona"
+          : "Start the voice changer to record"}
+      onclick={() => store.toggleRecording()}
+    >
+      <span class="dot" aria-hidden="true"></span>
+      {#if store.recording !== null}
+        <span class="num">{Math.floor(store.recording / 60)}:{String(Math.floor(store.recording % 60)).padStart(2, "0")}</span>
+      {:else}
+        <span>Rec</span>
+      {/if}
+    </button>
+    <button
       class="mute"
       class:on={store.muted}
       aria-pressed={store.muted}
@@ -133,6 +152,54 @@
     display: flex;
     justify-content: flex-end;
     gap: 6px;
+  }
+  .rec {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 30px;
+    min-width: 66px;
+    padding: 0 11px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-ctl);
+    background: var(--raised);
+    font-weight: 600;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .rec:hover:not(:disabled) {
+    border-color: var(--text-3);
+  }
+  .rec:disabled {
+    color: var(--text-3);
+    cursor: default;
+  }
+  .rec .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 1.5px solid currentColor;
+    flex: none;
+  }
+  .rec:not(:disabled) .dot {
+    border-color: var(--bad);
+  }
+  .rec.on {
+    border-color: color-mix(in srgb, var(--bad) 60%, var(--line));
+  }
+  .rec.on .dot {
+    background: var(--bad);
+    border-color: var(--bad);
+    animation: rec 1.2s ease-in-out infinite;
+  }
+  @keyframes rec {
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .rec.on .dot {
+      animation: none;
+    }
   }
   .mute {
     display: inline-flex;

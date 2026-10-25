@@ -190,13 +190,36 @@ export interface FxSettings {
   singing: boolean;
 }
 
+export interface PlayerState {
+  name: string | null;
+  playing: boolean;
+  looping: boolean;
+  position_s: number;
+  duration_s: number;
+}
+
+export interface Take {
+  dry: string;
+  wet: string;
+  seconds: number;
+}
+
+export interface SelfTestResult {
+  measured_ms: number;
+  runs_ms: number[];
+  spread_ms: number;
+  estimate_ms: number | null;
+  listen: string;
+}
+
 export type RuntimeEvent =
   | { type: "state"; state: EngineState; message: string | null }
   | ({ type: "stats" } & Stats)
   | { type: "meters"; input_peak: number; input_rms: number; output_peak: number; output_rms: number }
   | { type: "pitch"; input: number[]; output: number[] }
   | { type: "progress"; what: string; done: number; total: number }
-  | { type: "log"; line: string };
+  | { type: "log"; line: string }
+  | ({ type: "take" } & Take);
 
 export const api = {
   listDevices: () => invoke<{ inputs: DeviceInfo[]; outputs: DeviceInfo[] }>("list_devices"),
@@ -236,6 +259,15 @@ export const api = {
     invoke<void>("fx_param", { chain, slot, key, value }),
   chainExport: (path: string, chain: ChainSpec) => invoke<void>("chain_export", { path, chain }),
   chainImport: (path: string) => invoke<ChainSpec>("chain_import", { path }),
+  playerLoad: (path: string) => invoke<PlayerState>("player_load", { path }),
+  playerUnload: () => invoke<void>("player_unload"),
+  playerControl: (c: { playing?: boolean; seekS?: number; looping?: boolean }) =>
+    invoke<PlayerState>("player_control", { playing: c.playing ?? null, seekS: c.seekS ?? null, looping: c.looping ?? null }),
+  playerState: () => invoke<PlayerState>("player_state"),
+  recordStart: (stem: string) => invoke<void>("record_start", { stem }),
+  recordStop: () => invoke<Take>("record_stop"),
+  reveal: (path: string | null) => invoke<void>("reveal", { path }),
+  latencySelftest: (listen: string | null) => invoke<SelfTestResult>("latency_selftest", { listen }),
   onEvent: (cb: (e: RuntimeEvent) => void): Promise<UnlistenFn> =>
     listen<RuntimeEvent>("resona", (e) => cb(e.payload)),
   onImport: (cb: (p: { done: number; total: number; name: string | null }) => void) =>

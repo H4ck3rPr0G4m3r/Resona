@@ -8,7 +8,10 @@ import {
   type ImportReport,
   type KindSpec,
   type LibraryVoice,
+  type PlayerState,
+  type SelfTestResult,
   type Stats,
+  type Take,
 } from "./api";
 import { DEFAULT_PROFILE, DEFAULT_SETTINGS, mergeDefaults, type Profile, type Settings } from "./settings";
 
@@ -21,6 +24,15 @@ export interface Notice {
   id: number;
   kind: "info" | "error";
   text: string;
+  action?: { label: string; run: () => void };
+}
+
+const AUDIO_EXT = /\.(wav|mp3|flac)$/i;
+
+/** "2026-10-25 14-03-11", local time, safe in file names. */
+function stamp(d = new Date()) {
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
 }
 
 function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number) {
@@ -57,6 +69,17 @@ class Store {
   fxEditing = $state<FxTarget>(null);
   /** Recent underrun count (last ~10 s), for the dropout warning. */
   recentUnderruns = $state(0);
+  /** Sound file replacing the mic (null = microphone). */
+  player = $state<PlayerState | null>(null);
+  /** Seconds into the current A/B take, null when not recording. */
+  recording = $state<number | null>(null);
+  selftest = $state<{ running: boolean; result: SelfTestResult | null; error: string | null }>({
+    running: false,
+    result: null,
+    error: null,
+  });
+  private playerPoll: ReturnType<typeof setInterval> | undefined;
+  private recTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Pitch history (Hz, 0 = unvoiced). Not reactive; `traceVersion` ticks on update. */
   traceIn = new Float32Array(TRACE_FRAMES);
@@ -84,6 +107,9 @@ class Store {
     await Promise.all([this.refreshDevices(), this.refreshLibrary()]);
     this.muted = await api.getMuted().catch(() => false);
     this.catalog = await api.fxCatalog().catch(() => []);
+    const ps = await api.playerState().catch(() => null);
+    this.player = ps?.name ? ps : null;
+    if (this.player?.playing) this.playerControl({}); // resume position polling
     const st = await api.status().catch(() => null);
     if (st) this.engine = { state: st.state, message: st.message };
 
@@ -106,6 +132,10 @@ class Store {
           break;
         case "progress":
           this.assets = e.done >= e.total ? null : { what: e.what, done: e.done, total: e.total };
+          break;
+        case "take":
+          // The session stopped mid-take; the runtime finished it.
+          this.recordingEnded(e);
           break;
       }
     });
@@ -495,10 +525,96 @@ class Store {
     else if (action.startsWith("voice:")) this.select(action.slice(6));
   }
 
-  notify(kind: Notice["kind"], text: string) {
+  // -- sound-file input -----------------------------------------------------------------------
+  async loadSoundFile(path: string) {
+    try {
+      this.player = await api.playerLoad(path);
+      this.playerControl({ playing: true });
+    } catch (e) {
+      this.notify("error", String(e));
+    }
+  }
+
+  async playerControl(c: { playing?: boolean; seekS?: number; looping?: boolean }) {
+    if (!this.player) return;
+    this.player = await api.playerControl(c).catch(() => this.player);
+    clearInterval(this.playerPoll);
+    if (this.player?.playing) {
+      this.playerPoll = setInterval(async () => {
+        const st = await api.playerState().catch(() => null);
+        if (!st || !st.name) {
+          clearInterval(this.playerPoll);
+          return;
+        }
+        this.player = st;
+        if (!st.playing) clearInterval(this.playerPoll);
+      }, 200);
+    }
+  }
+
+  async unloadSoundFile() {
+    clearInterval(this.playerPoll);
+    await api.playerUnload().catch(() => {});
+    this.player = null;
+  }
+
+  /** Files dropped on the window: audio becomes the input source, the rest goes to the library. */
+  drop(paths: string[]) {
+    const audio = paths.filter((p) => AUDIO_EXT.test(p));
+    const models = paths.filter((p) => /\.(pth|index|zip)$/i.test(p) || !/\.[a-z0-9]{1,5}$/i.test(p));
+    if (audio.length) this.loadSoundFile(audio[0]);
+    if (models.length) this.importPaths(models);
+    if (!audio.length && !models.length) this.notify("error", "Drop voice models (.pth, .index, .zip, folders) or audio (.wav, .mp3, .flac).");
+  }
+
+  // -- A/B recorder ---------------------------------------------------------------------------
+  async toggleRecording() {
+    if (this.recording !== null) {
+      clearInterval(this.recTimer);
+      try {
+        this.recordingEnded(await api.recordStop());
+      } catch (e) {
+        this.recording = null;
+        this.notify("error", `Recording failed: ${e}`);
+      }
+      return;
+    }
+    if (!this.running) return;
+    try {
+      await api.recordStart(stamp());
+      const t0 = performance.now();
+      this.recording = 0;
+      this.recTimer = setInterval(() => (this.recording = (performance.now() - t0) / 1000), 250);
+    } catch (e) {
+      this.notify("error", `Could not start recording: ${e}`);
+    }
+  }
+
+  private recordingEnded(take: Take) {
+    clearInterval(this.recTimer);
+    this.recording = null;
+    const secs = take.seconds < 60 ? `${take.seconds.toFixed(1)} s` : `${Math.floor(take.seconds / 60)}:${String(Math.round(take.seconds % 60)).padStart(2, "0")}`;
+    this.notify("info", `Saved a ${secs} take (dry + wet) to Music\\Resona`, {
+      label: "Show",
+      run: () => api.reveal(take.wet).catch(() => {}),
+    });
+  }
+
+  // -- latency self-test ----------------------------------------------------------------------
+  async runSelfTest(listen: string | null) {
+    if (!this.running || this.selftest.running) return;
+    this.selftest = { running: true, result: null, error: null };
+    try {
+      this.selftest = { running: false, result: await api.latencySelftest(listen), error: null };
+    } catch (e) {
+      this.selftest = { running: false, result: null, error: String(e) };
+    }
+  }
+
+  notify(kind: Notice["kind"], text: string, action?: Notice["action"]) {
     const id = ++this.noticeId;
-    this.notices = [...this.notices, { id, kind, text }];
-    setTimeout(() => this.dismiss(id), kind === "error" ? 9000 : 4000);
+    this.notices = [...this.notices, { id, kind, text, action }];
+    setTimeout(() => this.dismiss(id), kind === "error" || action ? 9000 : 4000);
   }
 
   dismiss(id: number) {

@@ -223,6 +223,78 @@ fn chain_import(path: String) -> CmdResult<resona_dsp::fx::ChainSpec> {
 
 // -- shell ------------------------------------------------------------------------------------
 
+// -- sound-file input, A/B recorder, latency self-test ------------------------------------------
+
+#[tauri::command]
+async fn player_load(st: State<'_, AppState>, path: String) -> CmdResult<resona_runtime::player::PlayerState> {
+    blocking(&st, move |rt| rt.player_load(std::path::Path::new(&path)).map_err(err)).await
+}
+
+#[tauri::command]
+fn player_unload(st: State<'_, AppState>) {
+    st.rt.player_unload();
+}
+
+#[tauri::command]
+fn player_control(st: State<'_, AppState>, playing: Option<bool>, seek_s: Option<f32>, looping: Option<bool>) -> resona_runtime::player::PlayerState {
+    if let Some(l) = looping {
+        st.rt.player_set_loop(l);
+    }
+    if let Some(s) = seek_s {
+        st.rt.player_seek(s);
+    }
+    if let Some(p) = playing {
+        st.rt.player_play(p);
+    }
+    st.rt.player_state()
+}
+
+#[tauri::command]
+fn player_state(st: State<'_, AppState>) -> resona_runtime::player::PlayerState {
+    st.rt.player_state()
+}
+
+/// Takes go to `Music\Resona` (the user's audio folder).
+fn takes_dir(app: &AppHandle) -> CmdResult<PathBuf> {
+    Ok(app.path().audio_dir().map_err(err)?.join("Resona"))
+}
+
+#[tauri::command]
+fn record_start(app: AppHandle, st: State<'_, AppState>, stem: String) -> CmdResult<()> {
+    let stem: String = stem.chars().filter(|c| !r#"\/:*?"<>|"#.contains(*c)).collect();
+    st.rt.record_start(takes_dir(&app)?, stem).map_err(err)
+}
+
+#[tauri::command]
+async fn record_stop(st: State<'_, AppState>) -> CmdResult<resona_runtime::recorder::Take> {
+    blocking(&st, |rt| rt.record_stop().map_err(err)).await
+}
+
+#[tauri::command]
+fn record_state(st: State<'_, AppState>) -> Option<f32> {
+    st.rt.recording()
+}
+
+/// Show a file (or the takes folder) in Explorer.
+#[tauri::command]
+fn reveal(app: AppHandle, path: Option<String>) -> CmdResult<()> {
+    let mut cmd = std::process::Command::new("explorer");
+    match path {
+        Some(p) => cmd.arg(format!("/select,{p}")),
+        None => {
+            let dir = takes_dir(&app)?;
+            std::fs::create_dir_all(&dir).map_err(err)?;
+            cmd.arg(dir)
+        }
+    };
+    cmd.spawn().map(|_| ()).map_err(err)
+}
+
+#[tauri::command]
+async fn latency_selftest(st: State<'_, AppState>, listen: Option<String>) -> CmdResult<resona_runtime::selftest::SelfTestResult> {
+    blocking(&st, move |rt| rt.latency_self_test(listen).map_err(err)).await
+}
+
 #[tauri::command]
 fn apply_hotkeys(app: AppHandle, bindings: Vec<shell::Binding>) -> Vec<shell::BindingError> {
     shell::apply(&app, bindings)
@@ -330,6 +402,15 @@ pub fn run() {
             fx_param,
             chain_export,
             chain_import,
+            player_load,
+            player_unload,
+            player_control,
+            player_state,
+            record_start,
+            record_stop,
+            record_state,
+            reveal,
+            latency_selftest,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Resona");

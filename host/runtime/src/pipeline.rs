@@ -1,9 +1,10 @@
 //! Real-time audio pipeline.
 //!
 //! ```text
-//! capture cb ──► CaptureSide: meter, 48k→16k, block ──► SHM in-ring ──► engine
+//! capture cb ──► CaptureSide: file player, self-test, VAD, recorder (dry), input chain,
+//!                              meter, 48k→16k, block ──► SHM in-ring ──► engine
 //!            └─► dry FIFO (48k) ─────────────┐
-//! engine ──► SHM out-ring ──► DSP thread: SOLA, model-rate→48k, gain, meter ──► out FIFO ──► RenderSide ──► VAC
+//! engine ──► SHM out-ring ──► DSP thread: SOLA, output chain, gate, limiter, recorder (wet), gain ──► out FIFO ──► RenderSide ──► VAC
 //!                                         └─ passthrough/mute when engine is down    └► mon FIFO ──► RenderSide ──► headphones
 //! ```
 //!
@@ -21,12 +22,16 @@ use resona_dsp::fx::{live_chain, Effect, Limiter, LiveChain};
 use resona_dsp::{AtomicF32, Meter, MeterState, Resampler, Sola};
 
 use crate::fx::FxHub;
+use crate::player::{PlayerHub, PlayerSide};
+use crate::recorder::{DrySide, RecorderHub, WetSide};
+use crate::selftest::{Injector, SelfTestHub};
 use resona_shm_ipc::{NamedEvent, ShmRing};
 use serde::{Deserialize, Serialize};
 
 pub const RATE: usize = 48_000;
 const FADE: usize = 240; // 5 ms at 48 kHz
 const CAPTURE_MAX_CHUNK: usize = 4096;
+const CAPTURE_TAPS: usize = 64;
 
 /// Engine stream layout (mirrors the Python `StreamLayout`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +83,9 @@ pub struct Shared {
     pub sola_ncc: AtomicF32,
     pub stop: AtomicBool,
     pub fx: FxHub,
+    pub player: PlayerHub,
+    pub recorder: Arc<RecorderHub>,
+    pub selftest: SelfTestHub,
 }
 
 impl Default for Shared {
@@ -102,6 +110,9 @@ impl Default for Shared {
             sola_ncc: AtomicF32::new(1.0),
             stop: AtomicBool::new(false),
             fx: FxHub::default(),
+            player: PlayerHub::default(),
+            recorder: Arc::default(),
+            selftest: SelfTestHub::default(),
         }
     }
 }
@@ -191,15 +202,32 @@ pub struct CaptureSide {
     fx: LiveChain,
     vad: VadTracker,
     work: Vec<f32>,
+    player: PlayerSide,
+    rec: DrySide,
+    injector: Injector,
+    /// Raw-capture samples so far (the timeline the gate and recorder use).
+    raw_t: u64,
 }
 
 impl CaptureSide {
     pub fn process(&mut self, x: &[f32]) {
-        for raw in x.chunks(CAPTURE_MAX_CHUNK) {
+        self.process_timed(x, 0);
+    }
+
+    /// `qpc`: capture time of `x[0]` in 100 ns QPC units (0 = unknown).
+    pub fn process_timed(&mut self, x: &[f32], qpc: u64) {
+        const HNS: f64 = 1e7 / RATE as f64;
+        for (k, raw) in x.chunks(CAPTURE_MAX_CHUNK).enumerate() {
             let n = raw.len();
-            let fx = &self.shared.fx;
-            self.vad.feed(raw, |p| fx.push_vad(p));
-            self.work[..n].copy_from_slice(raw);
+            let sh = &*self.shared;
+            let w = &mut self.work[..n];
+            w.copy_from_slice(raw);
+            self.player.process(&sh.player, w);
+            let q = if qpc == 0 { 0 } else { qpc + ((k * CAPTURE_MAX_CHUNK) as f64 * HNS) as u64 };
+            self.injector.process(&sh.selftest, w, q);
+            self.vad.feed(w, |p| sh.fx.push_vad(p));
+            self.rec.push(&sh.recorder, self.raw_t, w);
+            self.raw_t += n as u64;
             self.fx.process(&mut self.work[..n]);
             self.shared.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
             let mut buf = std::mem::take(&mut self.work);
@@ -420,6 +448,7 @@ struct DspThread {
     limiter: Limiter,
     gate_g: f32,
     gate_held: usize,
+    rec: WetSide,
 }
 
 impl DspThread {
@@ -454,17 +483,31 @@ impl DspThread {
         }
     }
 
+    /// Fixed delay (48 kHz samples) between capture and the DSP thread's output, beyond the
+    /// block/lookahead framing: the 48→16 kHz filter, SOLA's nominal offset and the upsampler.
+    fn path_delay(&self) -> i64 {
+        let model = self.layout.model_sr as f32;
+        let capture = (CAPTURE_TAPS - 1) as f32 / 2.0;
+        let sola = self.layout.nominal_offset as f32 * RATE as f32 / model;
+        let up = if self.layout.model_sr == RATE { 0.0 } else { self.rs.delay_in() * RATE as f32 / model };
+        (capture + sola + up).round() as i64
+    }
+
     /// Output chain, voice gate and limiter on the freshly rendered block `seq` (`up[..n]`).
     fn post(&mut self, seq: u64, n: usize) {
+        let path_delay = self.path_delay();
         let buf = &mut self.up[..n];
         self.fx.process(buf);
         let fx = &self.shared.fx;
-        if fx.gate_on.load(Ordering::Relaxed) {
-            // Raw-capture time of this block's first output sample: block k covers input
-            // [k*B - L, (k+1)*B - L), and the input chain delayed what the engine heard.
-            let t0 = (seq as i64) * (self.layout.block_out as i64)
-                - fx.lookahead.load(Ordering::Relaxed) as i64
-                - fx.input_latency.load(Ordering::Relaxed) as i64;
+        // Raw-capture time of this block's first output sample: block k covers input
+        // [k*B - L, (k+1)*B - L); the input chain, both resamplers and SOLA's nominal offset
+        // delay it further.
+        let t0 = (seq as i64) * (self.layout.block_in * (RATE / 16_000)) as i64
+            - fx.lookahead.load(Ordering::Relaxed) as i64
+            - fx.input_latency.load(Ordering::Relaxed) as i64
+            - path_delay;
+        // The self-test's buzz is not speech to the VAD; it measures the path, not the gate.
+        if fx.gate_on.load(Ordering::Relaxed) && !self.shared.selftest.active.load(Ordering::Relaxed) {
             let thr = fx.gate_threshold.load();
             let hold = fx.gate_hold.load(Ordering::Relaxed);
             let rel = fx.gate_release.load();
@@ -493,7 +536,10 @@ impl DspThread {
         self.limiter.enabled = fx.limiter_on.load(Ordering::Relaxed);
         self.limiter.set(0, fx.limiter_ceiling_db.load());
         self.limiter.process(buf);
-        fx.output_latency.store(self.fx.latency() + Limiter::LATENCY, Ordering::Relaxed);
+        let out_lat = self.fx.latency() + Limiter::LATENCY;
+        fx.output_latency.store(out_lat, Ordering::Relaxed);
+        // Output-chain and limiter delay: what leaves now entered the chain `out_lat` ago.
+        self.rec.push(&self.shared.recorder, t0 - out_lat as i64, buf);
     }
 
     fn run(mut self) {
@@ -600,10 +646,12 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
     let (in_live, in_ctl) = live_chain();
     let (out_live, out_ctl) = live_chain();
     shared.fx.attach(in_ctl, out_ctl);
+    let player = shared.player.attach();
+    let (dry_rec, wet_rec) = shared.recorder.attach();
     let mut limiter = Limiter::new();
     limiter.reset();
     let capture = CaptureSide {
-        rs: Resampler::new(RATE as u32, 16_000, CAPTURE_MAX_CHUNK, 64),
+        rs: Resampler::new(RATE as u32, 16_000, CAPTURE_MAX_CHUNK, CAPTURE_TAPS),
         tmp: vec![0.0; CAPTURE_MAX_CHUNK / 3 + 8],
         block: vec![0.0; layout.block_in],
         fill: 0,
@@ -615,6 +663,10 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         fx: in_live,
         vad: VadTracker::new(),
         work: vec![0.0; CAPTURE_MAX_CHUNK],
+        player,
+        rec: dry_rec,
+        injector: Injector::default(),
+        raw_t: 0,
     };
     let rs = DspThread::new_resampler(&layout);
     let up = vec![0.0; rs.max_out(layout.block_out).max(layout.block_out)];
@@ -639,6 +691,7 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         limiter,
         gate_g: 1.0,
         gate_held: 0,
+        rec: wet_rec,
     };
     let handle = std::thread::Builder::new()
         .name("resona-dsp".into())
@@ -718,7 +771,7 @@ impl Pipeline {
             _ => None,
         };
         let e3 = on_device_error.clone();
-        let capture_stream = match resona_audio_io::CaptureStream::start(dev.input, move |x| capture.process(x), move |e| e3(format!("input: {e}"))) {
+        let capture_stream = match resona_audio_io::CaptureStream::start_timed(dev.input, move |x, qpc| capture.process_timed(x, qpc), move |e| e3(format!("input: {e}"))) {
             Ok(s) => s,
             Err(e) => {
                 drop(render_stream);
@@ -751,6 +804,7 @@ impl Pipeline {
             let _ = d.join();
         }
         self.shared.fx.detach();
+        self.shared.player.detach();
     }
 }
 

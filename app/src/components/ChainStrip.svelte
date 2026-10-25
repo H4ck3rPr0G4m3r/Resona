@@ -1,7 +1,7 @@
 <script lang="ts">
   // Signal flow, left to right: mic → input chain → voice → output chain → limiter → output.
   // Click a chip to edit it in place, drag to reorder, the lamp toggles bypass.
-  import Microphone from "phosphor-svelte/lib/Microphone";
+  import SourceNode from "./SourceNode.svelte";
   import SpeakerHigh from "phosphor-svelte/lib/SpeakerHigh";
   import Waveform from "phosphor-svelte/lib/Waveform";
   import Plus from "phosphor-svelte/lib/Plus";
@@ -177,10 +177,7 @@
   <SlotEditor />
   <footer class="strip" aria-label="Signal chain">
     <div class="flow" class:fade-l={fadeL} class:fade-r={fadeR} role="list" bind:this={flow} onscroll={edges} onwheel={wheel}>
-      <button class="node" onclick={openDevices} title="Microphone">
-        <Microphone size={15} />
-        <span class="dev">{store.live && live ? live.input.device_name : devName(store.inputs, s.input_device)}</span>
-      </button>
+      <SourceNode />
       <CaretRight size={11} class="arrow" />
       {@render chips("input")}
       <button
