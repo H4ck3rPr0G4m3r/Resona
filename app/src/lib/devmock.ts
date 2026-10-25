@@ -74,7 +74,7 @@ function startLive() {
     if (scenario === "underruns" && Math.random() < 0.15) under++;
     emit("resona", {
       type: "stats", processed: Math.round(t * 25), dropped: 0, backlog: 0, p50_ms: 14.6 + Math.random(), p99_ms: 17.2 + Math.random(),
-      vram_mb: 707, underruns: under, fifo_ms: 10, sola_ncc: 0.91,
+      vram_mb: 707, underruns: under, fifo_ms: 10, sola_ncc: 0.91, gpu_priority: params.get("gpuprio") ?? "high",
       latency: { input_ms: 10, block_ms: 40, lookahead_ms: 40, compute_ms: 15, buffer_ms: 10, effects_ms: 21.4, output_ms: 11, total_ms: 147.4 },
       devices: {
         input: { device_name: "Microphone (Shure MV7)", mode: "shared", latency_ms: 10 },

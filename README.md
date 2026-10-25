@@ -115,6 +115,12 @@ The latency bar under the pitch trace shows where every millisecond goes.
   - Watch *Dropouts* in the latency bar.
   - Raise the block size, or close GPU-heavy apps.
   - The buffer adapts by itself after a dropout and gives the time back once playback is stable.
+- **Dropouts while gaming:**
+  - The GPU work per block is set by the context window, not the block size, so a larger block
+    alone rarely helps. Lowering **Context** (Settings → Pipeline) does: 500 ms is about half the work.
+  - The engine raises its GPU scheduling priority so its short bursts go ahead of the game's frames.
+    If the dropout banner says this was refused, start Resona once as administrator.
+  - Capping the game's frame rate (in the game or the NVIDIA control panel) leaves the GPU room.
 - **Nothing reaches Discord:** check that Resona's Output is the cable's *playback* side and
   Discord's input is its *recording* side. Discord's own noise suppression can also eat converted
   voice; try turning it off.

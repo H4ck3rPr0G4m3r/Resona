@@ -7,6 +7,18 @@
 
   let showLog = $state(false);
 
+  /** What to do about dropouts, from what the engine reports. The GPU work per block is set by
+   *  the context window, not the block size, so a bigger block alone rarely fixes a busy GPU. */
+  function dropoutAdvice(): string {
+    const st = store.stats;
+    const block = st?.latency?.block_ms ?? 0;
+    if (st?.gpu_priority === "normal")
+      return "A game gets as much of the GPU as the voice: Resona could not raise its GPU priority. Start Resona once as administrator (right-click, Run as administrator).";
+    if (st && block && st.p99_ms > 0.8 * block)
+      return `A block of ${block} ms takes the GPU up to ${Math.round(st.p99_ms)} ms. Lower Context in Settings, Pipeline (it sets the work per block), or cap the game's frame rate.`;
+    return "The GPU is busy elsewhere now and then. Resona adds buffer by itself; capping a game's frame rate also helps.";
+  }
+
   type Banner = {
     kind: "bad" | "warn" | "info";
     title: string;
@@ -44,7 +56,7 @@
       return {
         kind: "warn",
         title: `${store.recentUnderruns} dropout${store.recentUnderruns > 1 ? "s" : ""} in the last 10 s`,
-        body: "The GPU is not keeping up. Raise the block size, or close other GPU-heavy apps.",
+        body: dropoutAdvice(),
         action: {
           label: "Performance",
           run: () => {

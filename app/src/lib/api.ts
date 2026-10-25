@@ -105,6 +105,8 @@ export interface Stats {
   fifo_ms?: number;
   sola_ncc?: number;
   gate_open?: boolean;
+  /** GPU scheduling priority the engine reached ("high", "above normal", or "normal" if refused). */
+  gpu_priority?: string;
   devices?: {
     input: { device_name: string; mode: string; latency_ms: number };
     output: { device_name: string; mode: string; latency_ms: number };
