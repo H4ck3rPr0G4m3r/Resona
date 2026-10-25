@@ -157,6 +157,12 @@ fn library_remove(id: String) -> CmdResult<()> {
     library::remove(&id).map_err(err)
 }
 
+/// Replace a voice's index with a copy of `path`, or drop it (`None`).
+#[tauri::command]
+fn library_set_index(id: String, path: Option<String>) -> CmdResult<Value> {
+    library::set_index(&id, path.as_deref().map(std::path::Path::new)).map_err(err)
+}
+
 /// Import files, folders or zips. Each model is inspected by the engine (which rejects unsupported
 /// architectures with a reason), then copied into the library with its paired index.
 #[tauri::command]
@@ -393,6 +399,7 @@ pub fn run() {
             library_list,
             library_update,
             library_remove,
+            library_set_index,
             library_import,
             apply_hotkeys,
             set_shell_prefs,

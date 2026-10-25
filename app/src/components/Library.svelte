@@ -7,6 +7,7 @@
   import Waveform from "phosphor-svelte/lib/Waveform";
   import X from "phosphor-svelte/lib/X";
   import { slide } from "svelte/transition";
+  import { open } from "@tauri-apps/plugin-dialog";
   import HotkeyInput from "./HotkeyInput.svelte";
   import { store } from "../lib/store.svelte";
   import { pickFiles, pickFolder } from "../lib/importing";
@@ -26,6 +27,11 @@
 
   const khz = (v: LibraryVoice) => `${v.info.sr / 1000}k`;
   const short = (p: string) => p.split(/[\\/]/).pop() ?? p;
+
+  async function chooseIndex(v: LibraryVoice) {
+    const path = await open({ filters: [{ name: "RVC index", extensions: ["index"] }] });
+    if (typeof path === "string") store.setVoiceIndex(v, path);
+  }
 
   function onKey(e: KeyboardEvent, v: LibraryVoice) {
     if (e.key === "Enter" || e.key === " ") {
@@ -119,7 +125,7 @@
         <div class="txt">
           <span class="name">{v.name}</span>
           <span class="sub num">
-            {khz(v)}{v.index_path ? "  idx" : ""}{#if v.hotkey}<kbd>{v.hotkey}</kbd>{/if}
+            {khz(v)}{#if v.index_path}<span class:shared={store.indexSuspect(v)} title={store.indexSuspect(v) ? `Index shared with ${v.index_shared_with?.join(", ")}` : undefined}>{"  idx"}</span>{/if}{#if v.hotkey}<kbd>{v.hotkey}</kbd>{/if}
           </span>
         </div>
         {#if isLive}<span class="live-tag">Live</span>{/if}
@@ -142,7 +148,20 @@
               <span class="label">Hotkey</span>
               <HotkeyInput value={v.hotkey ?? ""} onchange={(a) => store.setVoiceHotkey(v, a || null)} />
             </div>
-            <p class="file" title={v.source}>{v.model_file}{v.index_file ? ` + ${v.index_file}` : ""}</p>
+            <p class="file" title={v.source}>{v.model_file}</p>
+            <div class="field">
+              <span class="label">Index</span>
+              <p class="file">{v.index_file ?? "None"}</p>
+              {#if store.indexSuspect(v)}
+                <p class="shared">Also paired with {v.index_shared_with?.join(", ")}. An index belongs to one voice, so this is probably not {v.name}'s.</p>
+              {:else if v.index_shared_with?.length}
+                <p class="hint">Made for this voice, but also paired with {v.index_shared_with.join(", ")}.</p>
+              {/if}
+              <div class="ix-acts">
+                <button class="btn" onclick={() => chooseIndex(v)}>Choose index…</button>
+                {#if v.index_file}<button class="btn ghost" onclick={() => store.setVoiceIndex(v, null)}>Remove</button>{/if}
+              </div>
+            </div>
             {#if confirmRemove === v.id}
               <div class="confirm">
                 <span>Remove {v.name}? Its copied files are deleted.</span>
@@ -369,6 +388,17 @@
     font: 11px var(--mono);
     color: var(--text-3);
     overflow-wrap: anywhere;
+  }
+  .shared {
+    color: var(--warn);
+  }
+  p.shared {
+    margin: 0;
+    font-size: 12px;
+  }
+  .ix-acts {
+    display: flex;
+    gap: 6px;
   }
   .confirm {
     display: grid;

@@ -131,6 +131,10 @@ export interface LibraryVoice {
   favorite: boolean;
   hotkey: string | null;
   added_at: number;
+  /** Other voices using the same index file; it belongs to at most one of them. */
+  index_shared_with?: string[];
+  /** This voice's name is in the index's file name: it is the voice the index was made for. */
+  index_owner?: boolean;
 }
 
 export interface ImportReport {
@@ -247,6 +251,7 @@ export const api = {
   libraryUpdate: (id: string, patch: Partial<Pick<LibraryVoice, "favorite" | "hotkey" | "name">>) =>
     invoke<LibraryVoice>("library_update", { id, patch }),
   libraryRemove: (id: string) => invoke<void>("library_remove", { id }),
+  librarySetIndex: (id: string, path: string | null) => invoke<unknown>("library_set_index", { id, path }),
   libraryImport: (paths: string[]) => invoke<ImportReport>("library_import", { paths }),
   applyHotkeys: (bindings: Binding[]) =>
     invoke<{ accel: string; action: string; error: string }[]>("apply_hotkeys", { bindings }),

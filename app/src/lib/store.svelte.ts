@@ -398,6 +398,26 @@ class Store {
     await this.applyHotkeys();
   }
 
+  /** The voice uses an index that other voices use too and that is not named after it. */
+  indexSuspect(v: LibraryVoice) {
+    return !!v.index_shared_with?.length && !v.index_owner;
+  }
+
+  /** Give a voice another index (a copied `.index` file), or none. */
+  async setVoiceIndex(v: LibraryVoice, path: string | null) {
+    if (this.live && v.id === this.activeVoiceId) {
+      this.notify("error", "Switch to another voice or stop before changing the active voice's index.");
+      return;
+    }
+    try {
+      await api.librarySetIndex(v.id, path);
+      await this.refreshLibrary();
+      this.notify("info", path ? `${v.name} now uses ${path.split(/[\\/]/).pop()}` : `${v.name} no longer uses an index`);
+    } catch (e) {
+      this.notify("error", `Index not changed: ${e}`);
+    }
+  }
+
   async importPaths(paths: string[]) {
     if (!paths.length || this.importing) return;
     this.importing = { done: 0, total: 0, name: null };

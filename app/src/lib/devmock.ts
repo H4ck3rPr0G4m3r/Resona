@@ -33,6 +33,14 @@ let library = empty
       voice("YandereASMR", 40000, 150),
       voice("egirl", 48000, 400),
     ];
+if (params.has("sharedindex")) {
+  // An import from before the pairing fix: two voices got AnniePants' index.
+  const ap = library.find((v) => v.name.startsWith("AnniePants"))!;
+  for (const v of library.filter((x) => x.name === "Irene" || x.name === "YandereASMR")) {
+    v.index_file = ap.index_file;
+    v.index_path = ap.index_path;
+  }
+}
 
 const dev = (id: string, name: string, direction: string, is_default = false) => ({
   id, name, direction, is_default, mix_rate: 48000, mix_channels: 2,
@@ -118,15 +126,30 @@ export function install() {
           };
         case "settings_save": case "profile_save": return null;
         case "profile_load": return { pitch: 5, formant: 0, index_rate: 0.5, protect: 0.33, chain: null };
-        case "library_list": return library;
+        case "library_list":
+          return library.map((v) => ({
+            ...v,
+            index_shared_with: library.filter((o) => o !== v && o.index_file && o.index_file === v.index_file).map((o) => o.name),
+            index_owner: !!v.index_file?.includes(v.name),
+          }));
+        case "library_set_index": {
+          const v = library.find((x) => x.id === a.id)!;
+          v.index_file = a.path ? String(a.path).split(/[\\/]/).pop()! : null;
+          v.index_path = a.path ? `C:/voices/${v.index_file}` : null;
+          return v;
+        }
         case "library_update": {
           const v = library.find((x) => x.id === a.id)!;
           Object.assign(v, a.patch);
           return v;
         }
         case "library_remove": library = library.filter((x) => x.id !== a.id); return null;
-        case "plugin:dialog|open":
-          return (a.options as { directory?: boolean } | undefined)?.directory ? "D:/models" : ["D:/models/Narrator.pth"];
+        case "plugin:dialog|open": {
+          const o = (a.options ?? {}) as { directory?: boolean; multiple?: boolean; filters?: { extensions: string[] }[] };
+          if (o.directory) return "D:/models";
+          const file = o.filters?.[0]?.extensions.includes("index") ? "D:/models/added_IVF256_Flat_nprobe_1_Irene_v2.index" : "D:/models/Narrator.pth";
+          return o.multiple ? [file] : file;
+        }
         case "library_import": {
           // `&importfail` previews a failed import; otherwise one voice is added.
           const added = params.has("importfail") ? [] : [voice(`Narrator ${library.length + 1}`, 40000, 320)];
