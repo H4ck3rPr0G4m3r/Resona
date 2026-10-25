@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
-import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +19,13 @@ import torch
 import torch.nn.functional as F
 
 from ..assets import AssetPaths
+from ..pipeline import graphs
 from ..pipeline.f0post import F0Post, F0PostConfig, to_coarse
 from ..rvc.checkpoint import ModelInfo
 from ..rvc.contentvec import ContentVec
 from ..rvc.index import GpuIndex
 from ..rvc.rmvpe import RMVPE
-from ..rvc.synth import Synth
+from ..rvc.synth import FLOW_CONTEXT, Synth
 from .base import LiveParams, StageTimes, StreamConfig, StreamLayout
 
 SR_IN = 16000
@@ -114,12 +115,21 @@ class RVCv2Backend:
         self.profile = False
         self.last_times = StageTimes()
         self.last_f0: tuple[np.ndarray, np.ndarray] | None = None  # (input f0, output f0) for the block
+        self.use_graphs = graphs.available(self.device) and os.environ.get("RESONA_GRAPHS", "1") != "0"
+        self._g_content: graphs.Graph | None = None
+        self._g_rmvpe: graphs.Graph | None = None
+        self._g_synth: dict[int, graphs.Graph] = {}  # id(voice.synth) -> graph
+        self._side = torch.cuda.Stream(self.device) if self.use_graphs else None
 
     # -- configuration ---------------------------------------------------------------------
     def set_voice(self, voice: Voice) -> None:
         self.voice = voice
         if self.cfg:
             self.configure(self.cfg)
+
+    def forget(self, voice: Voice) -> None:
+        """Release the captured graph of an evicted voice."""
+        self._g_synth.pop(id(voice.synth), None)
 
     def configure(self, cfg: StreamConfig) -> StreamLayout:
         if self.voice is None:
@@ -136,12 +146,62 @@ class RVCv2Backend:
         self.Bo = msr(cfg.block_ms)
         self.out_len = self.Bo + self.X + self.S
         self.pad_f = cfg.dec_pad_ms // 10
+        self.ext = cfg.edge_audio_ms // 10
+        self.T_all = self.T + self.ext
+        self.region_start = self._region_start(sr, self.upp)
+        self.dec_first = self._dec_first(sr, self.upp)
         self.layout = StreamLayout(
             model_sr=sr, block_in=self.B, block_out=self.Bo, out_len=self.out_len,
             crossfade=self.X, search=self.S, nominal_offset=self.S // 2,
         )
         self.reset()
+        self._build_graphs()
         return self.layout
+
+    def _region_start(self, sr: int, upp: int) -> int:
+        """Model-rate sample (window-relative) where the returned region starts: S/2 before the block."""
+        return (self.C // HOP_IN) * upp - (self.cfg.sola_search_ms * sr // 1000) // 2
+
+    def _dec_first(self, sr: int, upp: int) -> int:
+        return max(self._region_start(sr, upp) // upp - self.pad_f, 0)
+
+    # -- CUDA graphs -----------------------------------------------------------------------
+    def _build_graphs(self) -> None:
+        if not self.use_graphs:
+            return
+        key = (self.T_all, self.cfg.f0_method)
+        if key == getattr(self, "_graph_key", None):
+            self.prepare_voice(self.voice)  # voice switch: feature graphs stay valid
+            return
+        self._graph_key = key
+        self._g_content = self._g_rmvpe = None
+        self._g_synth.clear()
+        n = self.T_all * HOP_IN
+        x = torch.zeros(n, device=self.device)
+        fs = self.features
+        self._g_content = graphs.Graph(fs.contentvec.extract, [x])
+        if self.cfg.f0_method == "rmvpe":
+            self._g_rmvpe = graphs.Graph(fs.rmvpe.salience, [x])
+        self.prepare_voice(self.voice)
+
+    def prepare_voice(self, voice: Voice) -> None:
+        """Capture the synth graph for `voice` at the current layout (no streaming state touched)."""
+        if not self.use_graphs or self.cfg is None or id(voice.synth) in self._g_synth:
+            return
+        synth, dev = voice.synth, self.device
+        dtype = self.features.contentvec.model.dtype
+        d0 = self._dec_first(voice.info.sr, synth.upp)
+        flow_head = max(d0 - FLOW_CONTEXT, 0)
+        dec_len = self.T_all - d0
+        inter = synth.z_noise.shape[0]
+        ex = [
+            torch.zeros(1, self.T_all, 768, device=dev, dtype=dtype),
+            torch.ones(1, self.T_all, device=dev, dtype=torch.long),
+            torch.zeros(1, inter, self.T_all - flow_head, device=dev, dtype=synth.emb_g.weight.dtype),
+            torch.zeros(1, 1, dec_len * synth.upp, device=dev),
+            synth.speaker(0),
+        ]
+        self._g_synth[id(synth)] = graphs.Graph(lambda *a: synth.core(*a, d0, dec_len), ex)
 
     def reset(self) -> None:
         self.buf = torch.zeros(self.W if self.cfg else 0, device=self.device)
@@ -162,6 +222,23 @@ class RVCv2Backend:
         self.f0post.reset()
         self.voice.synth.reset()
 
+    def _features(self, xin: torch.Tensor, p: LiveParams) -> tuple[torch.Tensor, torch.Tensor]:
+        """→ (raw f0 [T_all] Hz, content [1, T_all/2, 768]). Graphs run on parallel streams."""
+        fs, method = self.features, self.cfg.f0_method
+        g_content = self._g_content if abs(p.formant) < 1e-3 else None
+        if self._g_rmvpe is not None and method == "rmvpe":
+            cur = torch.cuda.current_stream(self.device)
+            self._side.wait_stream(cur)
+            with torch.cuda.stream(self._side):
+                sal = self._g_rmvpe(xin)
+            feats50 = g_content(xin) if g_content is not None else fs.content(xin, p.formant)
+            cur.wait_stream(self._side)
+            f0 = fs.rmvpe.decode(sal, p.f0_threshold)[: xin.shape[0] // HOP_IN]
+        else:
+            feats50 = g_content(xin) if g_content is not None else fs.content(xin, p.formant)
+            f0 = fs.f0(xin, method, p.f0_threshold)
+        return f0, feats50
+
     def _sync(self):
         if self.profile and self.device.type == "cuda":
             torch.cuda.synchronize()
@@ -180,12 +257,11 @@ class RVCv2Backend:
         abs_frame0 = (self.n_in - self.W) // HOP_IN
 
         self.f0post.cfg = F0PostConfig(median=p.f0_median, octave_fix=p.f0_octave_fix, glide_ms=p.f0_glide_ms)
-        T, ext = self.T, self.cfg.edge_audio_ms // 10
+        T, ext = self.T, self.ext
         xin = self.buf
         if ext:  # mirrored continuation so the right edge isn't conditioned on zeros
             xin = torch.cat([self.buf, torch.flip(self.buf[-ext * HOP_IN :], [0])])
-        feats50 = self.features.content(xin, p.formant)
-        f0_raw_all = self.features.f0(xin, self.cfg.f0_method, p.f0_threshold)
+        f0_raw_all, feats50 = self._features(xin, p)
         f0_raw = f0_raw_all[:T]
         t1 = self._sync()
 
@@ -202,14 +278,16 @@ class RVCv2Backend:
         T_all = phone.shape[1]
 
         # Region (model-rate samples, window-relative): starts S/2 before the block start.
-        upp = self.upp
-        region_start = (self.C // HOP_IN) * upp - self.S // 2
-        dec_first = max(region_start // upp - self.pad_f, 0)
-        wav = self.voice.synth.infer(
-            phone, pitch, f0s, abs_frame0, dec_first, T_all - dec_first, commit_phase=True
-        )
-        off = region_start - dec_first * upp
-        out = wav[off : off + self.out_len]
+        synth, d0 = self.voice.synth, self.dec_first
+        dec_len = T_all - d0
+        noise, exc, g = synth.prepare(T_all, f0s, abs_frame0, d0, dec_len, commit_phase=True)
+        graph = self._g_synth.get(id(synth))
+        if graph is not None:
+            wav = graph(phone, pitch, noise, exc, g)
+        else:
+            wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
+        off = self.region_start - d0 * self.upp
+        out = wav[off : off + self.out_len].clone()
         commit_upto = abs_frame0 + (self.C + self.B) // HOP_IN
         self.f0post.commit(commit_upto)
         t3 = self._sync()

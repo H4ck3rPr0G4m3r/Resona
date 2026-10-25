@@ -239,14 +239,18 @@ impl Runtime {
             let p50 = obj.get("p50_ms").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let (input_ms, output_ms) = sess.pipeline.as_ref().map(|p| (p.info.input.latency_ms, p.info.output.latency_ms)).unwrap_or((10.0, 10.0));
             let fifo_ms = s.fifo_samples.load(Ordering::Relaxed) as f32 / 48.0;
+            let jitter_ms = match s.jitter_samples.load(Ordering::Relaxed) {
+                0 => sess.cfg.jitter_ms,
+                n => n as f32 / 48.0,
+            };
             let latency = json!({
                 "input_ms": input_ms,
                 "block_ms": sess.layout.block_ms(),
                 "lookahead_ms": lookahead,
                 "compute_ms": p50,
-                "buffer_ms": sess.cfg.jitter_ms,
+                "buffer_ms": jitter_ms,
                 "output_ms": output_ms + 1.0,
-                "total_ms": input_ms + sess.layout.block_ms() + lookahead + p50 + sess.cfg.jitter_ms + output_ms + 1.0,
+                "total_ms": input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + output_ms + 1.0,
             });
             obj.insert("latency".into(), latency);
             obj.insert("underruns".into(), json!(s.underruns.load(Ordering::Relaxed)));
@@ -435,6 +439,25 @@ impl Runtime {
 
     pub fn inspect_model(&self, path: &str) -> Result<Value> {
         self.call("model.inspect", json!({"path": path}), T_SLOW)
+    }
+
+    /// Time the engine at several block sizes for `voice` and recommend the smallest that keeps
+    /// p99 compute within `budget` × block. Only while stopped (it borrows the GPU exclusively).
+    pub fn calibrate(&self, voice: &VoiceRef, stream: Value, blocks: &[u32]) -> Result<Value> {
+        let _guard = self.inner.control.lock();
+        if self.inner.session.lock().is_some() {
+            return Err(RuntimeError::Other("stop the session before calibrating".into()));
+        }
+        self.set_state(EngineState::Loading, Some(format!("calibrating {}", voice.id)));
+        let res = (|| -> Result<Value> {
+            self.call("model.load", json!({"id": voice.id, "path": voice.path, "index_path": voice.index_path}), T_SLOW)?;
+            self.call("model.activate", json!({"id": voice.id}), T_SLOW)?;
+            let stream = if stream.is_null() { json!({}) } else { stream };
+            self.call("stream.configure", json!({"config": stream}), T_SLOW)?;
+            self.call("engine.calibrate", json!({"blocks": blocks, "n": 80, "budget": 0.6}), T_SLOW)
+        })();
+        self.set_state(EngineState::Stopped, res.as_ref().err().map(|e| e.to_string()));
+        res
     }
 
     pub fn preload_voice(&self, voice: &VoiceRef) -> Result<Value> {

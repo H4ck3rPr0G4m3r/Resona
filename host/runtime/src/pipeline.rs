@@ -63,6 +63,8 @@ pub struct Shared {
     pub captured: AtomicU64,
     pub rendered: AtomicU64,
     pub fifo_samples: AtomicUsize,
+    /// Current (adaptive) render jitter target in 48 kHz samples.
+    pub jitter_samples: AtomicUsize,
     pub engine_live: AtomicBool,
     pub down_mode: AtomicU8,
     pub muted: AtomicBool,
@@ -85,6 +87,7 @@ impl Default for Shared {
             captured: AtomicU64::new(0),
             rendered: AtomicU64::new(0),
             fifo_samples: AtomicUsize::new(0),
+            jitter_samples: AtomicUsize::new(0),
             engine_live: AtomicBool::new(false),
             down_mode: AtomicU8::new(0),
             muted: AtomicBool::new(false),
@@ -215,12 +218,18 @@ impl CaptureSide {
 /// and floor + block. The controller watches the floor (minimum level over a 1 s window); if it
 /// sits above the jitter target — after a start-up burst or from slow clock drift — the excess
 /// is skipped with a short crossfade, so latency never creeps up.
+///
+/// The target itself adapts: an underrun raises it by `ADAPT_UP`, and after `RELAX_AFTER` without
+/// one it eases back toward the configured minimum, so a GPU that spikes now and then trades a few
+/// ms of latency for no dropouts instead of glitching repeatedly.
 pub struct RenderSide {
     fifo: rtrb::Consumer<f32>,
     starved: bool,
     fade_in: usize,
     last: f32,
     prefill: usize,
+    base_prefill: usize,
+    clean: usize,
     window_min: usize,
     window_pos: usize,
     scratch: Vec<f32>,
@@ -234,6 +243,11 @@ pub struct RenderSide {
 
 const CONTROL_WINDOW: usize = RATE; // 1 s
 const CONTROL_SLACK: usize = 3 * RATE / 1000; // tolerate 3 ms above target
+const ADAPT_UP: usize = 5 * RATE / 1000;
+const ADAPT_MAX: usize = 40 * RATE / 1000; // above the configured target
+const ADAPT_DOWN: usize = RATE / 1000;
+const RELAX_AFTER: usize = 20 * RATE; // underrun-free time before easing the target down
+const RELAX_EVERY: usize = 3 * RATE;
 
 impl RenderSide {
     fn new(fifo: rtrb::Consumer<f32>, prefill: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
@@ -243,6 +257,8 @@ impl RenderSide {
             fade_in: 0,
             last: 0.0,
             prefill: prefill.max(1),
+            base_prefill: prefill.max(1),
+            clean: 0,
             window_min: usize::MAX,
             window_pos: 0,
             scratch: vec![0.0; RATE + FADE],
@@ -259,6 +275,7 @@ impl RenderSide {
         let avail = self.fifo.slots();
         if self.count_underruns {
             self.shared.fifo_samples.store(avail, Ordering::Relaxed);
+            self.shared.jitter_samples.store(self.prefill, Ordering::Relaxed);
             self.shared.rendered.fetch_add(out.len() as u64, Ordering::Relaxed);
         }
         if self.starved {
@@ -286,6 +303,8 @@ impl RenderSide {
             if self.count_underruns {
                 self.shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
+            self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + ADAPT_MAX);
+            self.clean = 0;
             if n > 0 {
                 self.last = out[n - 1];
             }
@@ -309,6 +328,11 @@ impl RenderSide {
 
     /// Track the FIFO floor; once per window, skip any persistent excess above the target.
     fn control(&mut self, avail: usize, period: usize) {
+        self.clean += period;
+        if self.clean >= RELAX_AFTER {
+            self.prefill = self.prefill.saturating_sub(ADAPT_DOWN).max(self.base_prefill);
+            self.clean = RELAX_AFTER - RELAX_EVERY;
+        }
         self.window_min = self.window_min.min(avail);
         self.window_pos += period;
         if self.window_pos < CONTROL_WINDOW {
@@ -650,4 +674,45 @@ impl Drop for Pipeline {
 /// Small helper for waiting in tests and supervisors.
 pub fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(p: &mut rtrb::Producer<f32>, n: usize) {
+        for _ in 0..n {
+            p.push(0.1).unwrap();
+        }
+    }
+
+    #[test]
+    fn jitter_target_adapts_to_underruns_and_relaxes() {
+        let shared = Arc::new(Shared::default());
+        let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
+        let base = 10 * RATE / 1000;
+        let mut r = RenderSide::new(rx, base, None, shared.clone(), true);
+        let mut out = [0.0f32; 480];
+        feed(&mut tx, base + 240);
+        r.process(&mut out);
+        r.process(&mut out); // runs dry → underrun
+        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(r.prefill, base + ADAPT_UP);
+        // Steady supply for 40 s: the target eases back toward the configured minimum.
+        feed(&mut tx, base + ADAPT_UP);
+        for _ in 0..(40 * RATE / 480) {
+            feed(&mut tx, 480);
+            r.process(&mut out);
+        }
+        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
+        assert_eq!(r.prefill, base);
+        // Repeated underruns never push it past the cap.
+        for i in 0..20u64 {
+            feed(&mut tx, r.prefill);
+            while shared.underruns.load(Ordering::Relaxed) < 2 + i {
+                r.process(&mut out);
+            }
+        }
+        assert_eq!(r.prefill, base + ADAPT_MAX);
+    }
 }

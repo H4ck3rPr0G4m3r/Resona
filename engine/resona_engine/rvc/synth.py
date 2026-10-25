@@ -143,17 +143,26 @@ class Synth(nn.Module):
         sid: int = 0,
     ) -> torch.Tensor:
         """Returns audio [dec_len * upp] float32 for window frames [dec_start, dec_start+dec_len)."""
+        noise, exc, g = self.prepare(phone.shape[1], f0, abs_frame0, dec_start, dec_len, commit_phase, sid)
+        return self.core(phone, pitch, noise, exc, g, dec_start, dec_len)
+
+    def prepare(self, n_frames, f0, abs_frame0, dec_start, dec_len, commit_phase=True, sid=0):
+        """Stateful, position-dependent inputs of `core` (time-locked noise, NSF excitation)."""
+        flow_head = max(dec_start - FLOW_CONTEXT, 0)
+        noise = self.z_noise_at(abs_frame0 + flow_head, n_frames - flow_head).to(self.emb_g.weight.dtype)
+        exc = self.dec.m_source(f0[dec_start : dec_start + dec_len], abs_frame0 + dec_start, commit_phase)
+        return noise, exc, self.speaker(sid)
+
+    def core(self, phone, pitch, noise, exc, g, dec_start: int, dec_len: int) -> torch.Tensor:
+        """Pure, fixed-shape part (enc_p → flow → decoder); safe to capture as a CUDA graph."""
         dtype = self.emb_g.weight.dtype
-        g = self.speaker(sid)
         flow_head = max(dec_start - FLOW_CONTEXT, 0)
         m_p, logs_p = self.enc_p(phone.to(dtype), pitch, flow_head)
-        noise = self.z_noise_at(abs_frame0 + flow_head, m_p.shape[2]).to(dtype)
         z_p = m_p + torch.exp(logs_p) * noise * 0.66666
         x_mask = torch.ones_like(z_p[:, :1])
         z = self.flow.reverse(z_p, x_mask, g)
         off = dec_start - flow_head
         z = z[:, :, off : off + dec_len]
-        exc = self.dec.m_source(f0[dec_start : dec_start + dec_len], abs_frame0 + dec_start, commit_phase)
         return self.dec(z, exc, g)[0, 0].float()
 
     def reset(self) -> None:

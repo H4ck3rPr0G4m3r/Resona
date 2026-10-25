@@ -110,6 +110,12 @@ export interface Stats {
   };
 }
 
+export interface CalibrationResult {
+  results: { block_ms: number; p50_ms: number; p99_ms: number; ok: boolean }[];
+  recommended: number;
+  budget: number;
+}
+
 export type RuntimeEvent =
   | { type: "state"; state: EngineState; message: string | null }
   | ({ type: "stats" } & Stats)
@@ -125,6 +131,8 @@ export const api = {
   stop: () => invoke<void>("stop_session"),
   setParams: (params: Partial<LiveParams>) => invoke<LiveParams>("set_params", { params }),
   inspectModel: (path: string) => invoke<ModelInfo>("inspect_model", { path }),
+  calibrate: (voice: VoiceRef, stream?: Partial<StreamSettings>) =>
+    invoke<CalibrationResult>("calibrate", { voice, stream: stream ?? null }),
   activateVoice: (voice: VoiceRef) => invoke<void>("activate_voice", { voice }),
   preloadVoice: (voice: VoiceRef) => invoke<ModelInfo>("preload_voice", { voice }),
   setMuted: (muted: boolean) => invoke<void>("set_muted", { muted }),

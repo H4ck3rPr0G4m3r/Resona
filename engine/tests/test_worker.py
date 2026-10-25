@@ -87,3 +87,43 @@ def test_bad_config_is_an_error(worker):
         w.call("stream.configure", {"config": {"block_ms": 55}})
     with pytest.raises(RuntimeError):
         w.call("no.such.method")
+
+
+class FakeRpc:
+    def __init__(self):
+        self.methods, self.notes = {}, []
+
+    def method(self, name):
+        def deco(fn):
+            self.methods[name] = fn
+            return fn
+        return deco
+
+    def notify(self, method, params):
+        self.notes.append((method, params))
+
+
+def test_calibrate_and_voice_cache_on_gpu():
+    torch = pytest.importorskip("torch")
+    from tests.conftest import index_for, reference_models
+
+    models = [p for p in reference_models() if index_for(p)]
+    if not torch.cuda.is_available() or len(models) < 2:
+        pytest.skip("needs CUDA and reference models")
+    from resona_engine.worker import Engine
+
+    rpc = FakeRpc()
+    eng = Engine(rpc, None, stub=False)
+    call = lambda m, p=None: rpc.methods[m](p or {})  # noqa: E731
+    call("model.load", {"id": "a", "path": str(models[0]), "index_path": str(index_for(models[0]))})
+    call("model.activate", {"id": "a"})
+    call("stream.configure", {"config": {"block_ms": 60}})
+    call("model.load", {"id": "b", "path": str(models[1])})
+    assert len(eng.backend._g_synth) == 2  # preloaded voice captured ahead of activation
+    res = call("engine.calibrate", {"blocks": [40, 100], "n": 20})
+    assert [r["block_ms"] for r in res["results"]] == [40, 100]
+    assert res["recommended"] in (40, 100)
+    assert eng.cfg.block_ms == 60 and eng.layout.block_in == 960  # configuration restored
+    assert len(eng.backend._g_synth) == 2
+    call("model.unload", {"id": "b"})
+    assert len(eng.backend._g_synth) == 1

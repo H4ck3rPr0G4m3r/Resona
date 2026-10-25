@@ -2,6 +2,7 @@
 //! engine mid-run to exercise crash recovery.
 //!
 //! cargo run -p resona-runtime --example live -- <model.pth> [index] [seconds] [--kill-at N] [--out "Line 1"]
+//!     [--block 60 | --block auto]   (auto = run the engine calibration first)
 
 use std::time::{Duration, Instant};
 
@@ -40,11 +41,22 @@ fn main() {
         false,
     )
     .unwrap();
+    let voice = json!({"id": "v1", "path": model, "index_path": index});
+    let block: u64 = match flag("--block").as_deref() {
+        Some("auto") => {
+            let vr = serde_json::from_value(voice.clone()).unwrap();
+            let res = rt.calibrate(&vr, json!({}), &[40, 60, 80, 100]).expect("calibrate");
+            println!("[calibrate] {res}");
+            res["recommended"].as_u64().unwrap_or(60)
+        }
+        Some(b) => b.parse().expect("--block"),
+        None => 60,
+    };
     let cfg: SessionConfig = serde_json::from_value(json!({
         "output": {"device_id": out_id, "mode": out_mode},
-        "voice": {"id": "v1", "path": model, "index_path": index},
+        "voice": voice,
         "params": {"pitch": 0},
-        "stream": {"block_ms": 60},
+        "stream": {"block_ms": block},
         "jitter_ms": 10
     }))
     .unwrap();

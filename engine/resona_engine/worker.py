@@ -175,7 +175,7 @@ class Engine:
             with self.lock:
                 if p["id"] == self.active:
                     raise RpcError("cannot unload the active voice")
-                self.voices.pop(p["id"], None)
+                self._forget(self.voices.pop(p["id"], None))
                 if p["id"] in self.voice_order:
                     self.voice_order.remove(p["id"])
             return True
@@ -183,6 +183,10 @@ class Engine:
         @m("stream.configure")
         def stream_configure(p):
             return self.configure(p.get("config") or {})
+
+        @m("engine.calibrate")
+        def engine_calibrate(p):
+            return self.calibrate(p.get("blocks") or [40, 60, 80, 100], int(p.get("n", 80)), float(p.get("budget", 0.6)))
 
         @m("stream.start")
         def stream_start(_):
@@ -231,7 +235,9 @@ class Engine:
                 if old is None:
                     break
                 self.voice_order.remove(old)
-                self.voices.pop(old, None)
+                self._forget(self.voices.pop(old, None))
+            if self.backend is not None and self.cfg is not None:
+                self.backend.prepare_voice(voice)  # capture now so activation is seamless
         self._torch().cuda.empty_cache()
         log(f"voice {vid} loaded in {time.perf_counter() - t:.2f}s ({voice.info.name}, {voice.info.sr} Hz)")
         info = voice.info.to_dict()
@@ -274,8 +280,65 @@ class Engine:
             elif self.backend is None:
                 raise RpcError("load and activate a voice first", -32011)
             self.layout = self.backend.configure(cfg)
+            self._prepare_cached()
             self._warmup()
             return self.layout.to_dict()
+
+    def _forget(self, voice) -> None:
+        if voice is not None and self.backend is not None and hasattr(self.backend, "forget"):
+            self.backend.forget(voice)
+
+    def _prepare_cached(self) -> None:
+        if hasattr(self.backend, "prepare_voice"):
+            for v in self.voices.values():
+                self.backend.prepare_voice(v)
+
+    def calibrate(self, blocks: list[int], n: int, budget: float) -> dict:
+        """Time each block size on this GPU; recommend the smallest with p99 <= budget * block."""
+        if self.stub:
+            return {"results": [], "recommended": self.cfg.block_ms if self.cfg else 60}
+        if self.running.is_set():
+            raise RpcError("stop the stream before calibrating", -32014)
+        from dataclasses import replace
+
+        import torch
+
+        from .backends.base import LiveParams, StreamConfig
+
+        with self.lock:
+            if self.backend is None:
+                raise RpcError("load and activate a voice first", -32011)
+            base = self.cfg or StreamConfig()
+            params = self.params or LiveParams()
+            rng = np.random.default_rng(0)
+            results = []
+            try:
+                for b in blocks:
+                    try:
+                        cfg = replace(base, block_ms=int(b)).validate()
+                    except ValueError:
+                        continue
+                    lay = self.backend.configure(cfg)
+                    t = np.arange(lay.block_in * (n + 5)) / 16000
+                    x = (0.2 * np.sin(2 * np.pi * 160 * t) + 0.02 * rng.standard_normal(t.shape)).astype(np.float32)
+                    times = []
+                    for i in range(n + 5):
+                        t0 = time.perf_counter()
+                        self.backend.process(torch.from_numpy(x[i * lay.block_in : (i + 1) * lay.block_in]), params).cpu()
+                        if i >= 5:
+                            times.append((time.perf_counter() - t0) * 1e3)
+                    times.sort()
+                    p50, p99 = times[len(times) // 2], times[min(int(len(times) * 0.99), len(times) - 1)]
+                    results.append({"block_ms": int(b), "p50_ms": round(p50, 2), "p99_ms": round(p99, 2),
+                                    "ok": p99 <= budget * b})
+                    log(f"calibrate block {b} ms: p50 {p50:.1f} p99 {p99:.1f}")
+            finally:
+                self.layout = self.backend.configure(base) if self.cfg else self.layout
+                if self.cfg:
+                    self._prepare_cached()
+            ok = [r["block_ms"] for r in results if r["ok"]]
+            rec = min(ok) if ok else max((r["block_ms"] for r in results), default=base.block_ms)
+            return {"results": results, "recommended": rec, "budget": budget}
 
     def _warmup(self, n: int = 3) -> None:
         if self.stub:

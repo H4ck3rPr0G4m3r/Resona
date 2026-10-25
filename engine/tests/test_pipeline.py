@@ -81,3 +81,39 @@ def test_formant_shift_runs(features, voice):
     x = load_mono(CLIPS / "speech.wav", 16000)[:16000]
     y = convert_offline(features, voice, x, LiveParams(formant=3.0))
     assert np.isfinite(y).all() and np.abs(y).max() > 1e-3
+
+
+def _stream(be, x, lay, p):
+    return torch.cat([be.process(torch.from_numpy(x[i : i + lay.block_in]), p) for i in range(0, len(x) - lay.block_in + 1, lay.block_in)])
+
+
+@pytest.mark.parametrize("formant", [0.0, 2.0])
+def test_cuda_graphs_match_eager(features, voice, formant):
+    x = load_mono(CLIPS / "speech.wav", 16000)
+    x = x[: 16000 * 3]
+    p = LiveParams(index_rate=0.5, formant=formant)
+    eager = RVCv2Backend(features, voice)
+    eager.use_graphs = False
+    lay = eager.configure(StreamConfig())
+    graph = RVCv2Backend(features, voice)
+    graph.configure(StreamConfig())
+    assert graph._g_synth and graph._g_content is not None
+    a, b = _stream(eager, x, lay, p), _stream(graph, x, lay, p)
+    assert a.shape == b.shape
+    err = (a - b).abs()
+    assert float(err.max()) < 2e-2 and float(err.mean()) < 1e-3, (float(err.max()), float(err.mean()))
+
+
+def test_voice_switch_reuses_feature_graphs(features, voice):
+    be = RVCv2Backend(features, voice)
+    be.configure(StreamConfig())
+    g_content = be._g_content
+    other = Voice(voice.info, Voice.load(next(p for p in reference_models() if "Trump" not in str(p)), None, torch.device("cuda")).synth, None)
+    be.prepare_voice(other)
+    assert len(be._g_synth) == 2
+    be.set_voice(other)
+    assert be._g_content is g_content
+    out = be.process(torch.zeros(960), LiveParams())
+    assert torch.isfinite(out).all()
+    be.forget(other)
+    assert len(be._g_synth) == 1

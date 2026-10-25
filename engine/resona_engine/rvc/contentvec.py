@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import torch
@@ -20,7 +21,7 @@ class ContentVec(nn.Module):
         hf_logging.set_verbosity_error()
         logging.getLogger("transformers").setLevel(logging.ERROR)
         model_dir = Path(model_dir)
-        config = HubertConfig.from_pretrained(model_dir)
+        config = HubertConfig.from_pretrained(model_dir, attn_implementation=os.environ.get("RESONA_ATTN", "sdpa"))
         model = HubertModel(config)
         state = torch.load(model_dir / "pytorch_model.bin", map_location="cpu", weights_only=True)
         # content-vec-best ships a `final_proj` head that RVC v2 does not use.

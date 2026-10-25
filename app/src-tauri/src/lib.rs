@@ -83,6 +83,11 @@ async fn inspect_model(st: State<'_, AppState>, path: String) -> CmdResult<Value
 }
 
 #[tauri::command]
+async fn calibrate(st: State<'_, AppState>, voice: VoiceRef, stream: Option<Value>) -> CmdResult<Value> {
+    blocking(&st, move |rt| rt.calibrate(&voice, stream.unwrap_or(Value::Null), &[40, 60, 80, 100]).map_err(err)).await
+}
+
+#[tauri::command]
 async fn activate_voice(st: State<'_, AppState>, voice: VoiceRef) -> CmdResult<()> {
     blocking(&st, move |rt| rt.activate_voice(&voice).map_err(err)).await
 }
@@ -146,6 +151,7 @@ pub fn run() {
             stop_session,
             set_params,
             inspect_model,
+            calibrate,
             activate_voice,
             preload_voice,
             set_muted,
