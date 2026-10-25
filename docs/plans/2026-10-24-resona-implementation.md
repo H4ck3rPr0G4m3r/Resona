@@ -178,3 +178,4 @@ audio rings plus JSON-RPC.
 ## M6 — Filters
 - 6.1 Expression language + TOML composite filters + primitives registry.
 - 6.2 Hot-reload, generated UI, Bad Mic.
+- Status: deferred (not started).
