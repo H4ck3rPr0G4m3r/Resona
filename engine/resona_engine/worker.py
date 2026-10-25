@@ -103,6 +103,7 @@ class Engine:
         self.times: deque = deque(maxlen=100)
         self.dropped = 0
         self.processed = 0
+        self.priority: dict[str, str] = {}  # GPU/CPU scheduling priority reached (see priority.py)
         self.ring_in = self.ring_out = self.ev_in = self.ev_out = None
         self._register()
 
@@ -484,6 +485,8 @@ class Engine:
         if self.backend is not None and getattr(self.backend, "last_times", None) is not None:
             lt = self.backend.last_times
             stats.update(features_ms=lt.features_ms, f0post_ms=lt.f0post_ms, synth_ms=lt.synth_ms)
+        if self.priority:
+            stats["gpu_priority"] = self.priority.get("gpu", "normal")
         if not self.stub:
             torch = self._torch()
             if torch.cuda.is_available():
@@ -503,6 +506,12 @@ def main(argv=None) -> int:
     sys.stdout = sys.stderr
     rpc = RpcServer(stdin=sys.stdin, stdout=rpc_out)
     engine = Engine(rpc, args.shm, args.stub)
+    if not args.stub:
+        # Before CUDA starts, so every GPU context of this process gets the raised class.
+        from .priority import raise_priority
+
+        engine.priority = raise_priority()
+        log(f"scheduling priority: GPU {engine.priority['gpu']}, CPU {engine.priority['cpu']}")
     log(f"ready (protocol {PROTOCOL}, stub={args.stub})")
     rpc.notify("ready", {"protocol": PROTOCOL})
     try:
