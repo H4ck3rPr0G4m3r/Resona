@@ -156,10 +156,10 @@ class Engine:
 
         @m("model.inspect")
         def model_inspect(p):
-            from .rvc.checkpoint import CheckpointError, inspect
+            from .rvc.checkpoint import CheckpointError, check_supported, inspect
 
             try:
-                return inspect(p["path"]).to_dict()
+                return check_supported(inspect(p["path"])).to_dict()
             except CheckpointError as e:
                 raise RpcError(str(e), -32010)
 
