@@ -67,7 +67,7 @@ function startLive() {
     emit("resona", {
       type: "stats", processed: Math.round(t * 25), dropped: 0, backlog: 0, p50_ms: 14.6 + Math.random(), p99_ms: 17.2 + Math.random(),
       vram_mb: 707, underruns: under, fifo_ms: 10, sola_ncc: 0.91,
-      latency: { input_ms: 10, block_ms: 40, lookahead_ms: 40, compute_ms: 15, buffer_ms: 10, output_ms: 11, total_ms: 126 },
+      latency: { input_ms: 10, block_ms: 40, lookahead_ms: 40, compute_ms: 15, buffer_ms: 10, effects_ms: 21.4, output_ms: 11, total_ms: 147.4 },
       devices: {
         input: { device_name: "Microphone (Shure MV7)", mode: "shared", latency_ms: 10 },
         output: { device_name: "Line 1 (Virtual Audio Cable)", mode: "shared", latency_ms: 10 },
@@ -125,8 +125,15 @@ export function install() {
           return v;
         }
         case "library_remove": library = library.filter((x) => x.id !== a.id); return null;
-        case "library_import":
-          return new Promise((r) => setTimeout(() => r({ added: [], skipped: [], failed: [{ path: "D:/m/refine.pth", error: "refine.pth: unsupported vocoder RefineGAN" }] }), 800));
+        case "plugin:dialog|open":
+          return (a.options as { directory?: boolean } | undefined)?.directory ? "D:/models" : ["D:/models/Narrator.pth"];
+        case "library_import": {
+          // `&importfail` previews a failed import; otherwise one voice is added.
+          const added = params.has("importfail") ? [] : [voice(`Narrator ${library.length + 1}`, 40000, 320)];
+          library = [...library, ...added];
+          const failed = params.has("importfail") ? [{ path: "D:/m/refine.pth", error: "refine.pth: unsupported vocoder RefineGAN" }] : [];
+          return new Promise((r) => setTimeout(() => r({ added, skipped: [], failed }), 800));
+        }
         case "get_muted": return muted;
         case "set_muted": muted = a.muted as boolean; emit("muted", { muted }); return null;
         case "apply_hotkeys": return [];

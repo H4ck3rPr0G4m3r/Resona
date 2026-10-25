@@ -208,10 +208,12 @@
 </aside>
 
 <style>
+  /* A column, not a fixed row template: the search, progress and report rows come and go, and
+     the list must always be the part that takes the spare height and scrolls. */
   .rail {
     grid-area: rail;
-    display: grid;
-    grid-template-rows: auto auto auto 1fr auto;
+    display: flex;
+    flex-direction: column;
     min-height: 0;
     border-right: 1px solid var(--line);
     background: var(--panel);
@@ -261,6 +263,7 @@
     border-color: var(--accent);
   }
   .list {
+    flex: 1;
     overflow-y: auto;
     padding: 2px 6px 10px;
     min-height: 0;
@@ -443,6 +446,7 @@
     transition: width 0.3s var(--ease);
   }
   .report {
+    flex: none;
     margin: 0 8px 8px;
     border: 1px solid var(--line);
     border-radius: var(--r-panel);

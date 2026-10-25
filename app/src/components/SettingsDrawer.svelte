@@ -7,7 +7,7 @@
   import HotkeyInput from "./HotkeyInput.svelte";
   import { store } from "../lib/store.svelte";
   import { api, type DeviceMode } from "../lib/api";
-  import type { Hotkeys, Settings } from "../lib/settings";
+  import { fitCrossfade, type Hotkeys, type Settings } from "../lib/settings";
 
   const TABS = [
     ["devices", "Devices"],
@@ -35,6 +35,8 @@
   }
   function setStream(k: keyof Settings["stream"], v: number | string) {
     (store.settings.stream as Record<string, unknown>)[k] = v;
+    // A smaller lookahead or a wider search pulls the stored crossfade down, not just the fader.
+    fitCrossfade(store.settings.stream);
     save();
   }
   function setHotkey(k: keyof Hotkeys, accel: string) {
@@ -259,7 +261,7 @@
         {/each}
         <div class="field">
           <span class="label">Seam crossfade <span class="num val">{stream.crossfade_ms ?? 10} ms</span></span>
-          <Fader label="Seam crossfade" wheel={false} value={Math.min(stream.crossfade_ms ?? 10, xfadeMax)} min={0} max={Math.max(10, Math.floor(xfadeMax / 10) * 10)} step={10} defaultValue={10}
+          <Fader label="Seam crossfade" wheel={false} value={stream.crossfade_ms ?? 10} min={0} max={Math.max(10, Math.floor(xfadeMax / 10) * 10)} step={10} defaultValue={10}
             onchange={(v) => setStream("crossfade_ms", v)} />
           <span class="hint">Crossfade plus half the seam search must fit inside the lookahead.</span>
         </div>
