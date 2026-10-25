@@ -16,7 +16,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
+use resona_dsp::fx::denoise::VadTracker;
+use resona_dsp::fx::{live_chain, Effect, Limiter, LiveChain};
 use resona_dsp::{AtomicF32, Meter, MeterState, Resampler, Sola};
+
+use crate::fx::FxHub;
 use resona_shm_ipc::{NamedEvent, ShmRing};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +77,7 @@ pub struct Shared {
     pub monitor_tap: AtomicU8, // 0 = processed, 1 = dry
     pub sola_ncc: AtomicF32,
     pub stop: AtomicBool,
+    pub fx: FxHub,
 }
 
 impl Default for Shared {
@@ -96,6 +101,7 @@ impl Default for Shared {
             monitor_tap: AtomicU8::new(0),
             sola_ncc: AtomicF32::new(1.0),
             stop: AtomicBool::new(false),
+            fx: FxHub::default(),
         }
     }
 }
@@ -182,10 +188,27 @@ pub struct CaptureSide {
     dry: rtrb::Producer<f32>,
     meter: MeterState,
     shared: Arc<Shared>,
+    fx: LiveChain,
+    vad: VadTracker,
+    work: Vec<f32>,
 }
 
 impl CaptureSide {
     pub fn process(&mut self, x: &[f32]) {
+        for raw in x.chunks(CAPTURE_MAX_CHUNK) {
+            let n = raw.len();
+            let fx = &self.shared.fx;
+            self.vad.feed(raw, |p| fx.push_vad(p));
+            self.work[..n].copy_from_slice(raw);
+            self.fx.process(&mut self.work[..n]);
+            self.shared.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
+            let mut buf = std::mem::take(&mut self.work);
+            self.process_chunk(&buf[..n]);
+            std::mem::swap(&mut self.work, &mut buf);
+        }
+    }
+
+    fn process_chunk(&mut self, x: &[f32]) {
         self.meter.process(x, &self.shared.in_meter);
         self.shared.captured.fetch_add(x.len() as u64, Ordering::Relaxed);
         push_slice(&mut self.dry, x);
@@ -393,6 +416,10 @@ struct DspThread {
     jitter: usize,
     primed: bool,
     mute_gain: f32,
+    fx: LiveChain,
+    limiter: Limiter,
+    gate_g: f32,
+    gate_held: usize,
 }
 
 impl DspThread {
@@ -425,6 +452,48 @@ impl DspThread {
                 push_slice(m, buf);
             }
         }
+    }
+
+    /// Output chain, voice gate and limiter on the freshly rendered block `seq` (`up[..n]`).
+    fn post(&mut self, seq: u64, n: usize) {
+        let buf = &mut self.up[..n];
+        self.fx.process(buf);
+        let fx = &self.shared.fx;
+        if fx.gate_on.load(Ordering::Relaxed) {
+            // Raw-capture time of this block's first output sample: block k covers input
+            // [k*B - L, (k+1)*B - L), and the input chain delayed what the engine heard.
+            let t0 = (seq as i64) * (self.layout.block_out as i64)
+                - fx.lookahead.load(Ordering::Relaxed) as i64
+                - fx.input_latency.load(Ordering::Relaxed) as i64;
+            let thr = fx.gate_threshold.load();
+            let hold = fx.gate_hold.load(Ordering::Relaxed);
+            let rel = fx.gate_release.load();
+            let range = fx.gate_range.load();
+            let att = 1.0 - (-1.0f32 / (0.002 * RATE as f32)).exp();
+            let mut open = false;
+            for (j, v) in buf.iter_mut().enumerate() {
+                if j % 48 == 0 {
+                    // ~1 ms resolution; look 20 ms ahead so the gate is open before a word starts.
+                    open = fx.vad_at(t0 + j as i64, 2) >= thr;
+                }
+                if open {
+                    self.gate_held = hold;
+                } else {
+                    self.gate_held = self.gate_held.saturating_sub(1);
+                }
+                let target = if open || self.gate_held > 0 { 1.0 } else { range };
+                self.gate_g += (target - self.gate_g) * if target > self.gate_g { att } else { rel };
+                *v *= self.gate_g;
+            }
+            fx.gate_open.store(self.gate_g > 0.5, Ordering::Relaxed);
+        } else {
+            self.gate_g = 1.0;
+            fx.gate_open.store(true, Ordering::Relaxed);
+        }
+        self.limiter.enabled = fx.limiter_on.load(Ordering::Relaxed);
+        self.limiter.set(0, fx.limiter_ceiling_db.load());
+        self.limiter.process(buf);
+        fx.output_latency.store(self.fx.latency() + Limiter::LATENCY, Ordering::Relaxed);
     }
 
     fn run(mut self) {
@@ -466,6 +535,7 @@ impl DspThread {
                 } else {
                     self.rs.process(&self.block, &mut self.up)
                 };
+                self.post(h.seq, n);
                 self.push_out(n, false);
                 out_meter.process(&self.up[..n], &self.shared.out_meter);
             }
@@ -527,6 +597,11 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
     };
     let render = render_side(out_c, false);
     let monitor = mon_c.map(|c| render_side(c, true));
+    let (in_live, in_ctl) = live_chain();
+    let (out_live, out_ctl) = live_chain();
+    shared.fx.attach(in_ctl, out_ctl);
+    let mut limiter = Limiter::new();
+    limiter.reset();
     let capture = CaptureSide {
         rs: Resampler::new(RATE as u32, 16_000, CAPTURE_MAX_CHUNK, 64),
         tmp: vec![0.0; CAPTURE_MAX_CHUNK / 3 + 8],
@@ -537,6 +612,9 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         dry: dry_p,
         meter: MeterState::new(RATE as f32),
         shared: shared.clone(),
+        fx: in_live,
+        vad: VadTracker::new(),
+        work: vec![0.0; CAPTURE_MAX_CHUNK],
     };
     let rs = DspThread::new_resampler(&layout);
     let up = vec![0.0; rs.max_out(layout.block_out).max(layout.block_out)];
@@ -557,6 +635,10 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         jitter,
         primed: false,
         mute_gain: 1.0,
+        fx: out_live,
+        limiter,
+        gate_g: 1.0,
+        gate_held: 0,
     };
     let handle = std::thread::Builder::new()
         .name("resona-dsp".into())
@@ -668,6 +750,7 @@ impl Pipeline {
         if let Some(d) = self.dsp.take() {
             let _ = d.join();
         }
+        self.shared.fx.detach();
     }
 }
 

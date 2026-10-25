@@ -1,0 +1,523 @@
+[
+  {
+    "kind": "gain",
+    "name": "Gain",
+    "stage": "both",
+    "params": [
+      {
+        "key": "gain",
+        "name": "Gain",
+        "min": -24.0,
+        "max": 24.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "filter",
+    "name": "Filter",
+    "stage": "both",
+    "params": [
+      {
+        "key": "mode",
+        "name": "Type",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.0,
+        "unit": "",
+        "scale": {
+          "choice": [
+            "Low-pass",
+            "High-pass"
+          ]
+        }
+      },
+      {
+        "key": "freq",
+        "name": "Cutoff",
+        "min": 20.0,
+        "max": 20000.0,
+        "default": 8000.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "q",
+        "name": "Resonance",
+        "min": 0.5,
+        "max": 12.0,
+        "default": 0.707,
+        "unit": "",
+        "scale": "log"
+      },
+      {
+        "key": "slope",
+        "name": "Slope",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.0,
+        "unit": "",
+        "scale": {
+          "choice": [
+            "12 dB/oct",
+            "24 dB/oct"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "kind": "eq",
+    "name": "Equalizer",
+    "stage": "output",
+    "params": [
+      {
+        "key": "f1",
+        "name": "Low freq",
+        "min": 20.0,
+        "max": 500.0,
+        "default": 100.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "g1",
+        "name": "Low gain",
+        "min": -18.0,
+        "max": 18.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "f2",
+        "name": "Low-mid freq",
+        "min": 100.0,
+        "max": 2000.0,
+        "default": 400.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "g2",
+        "name": "Low-mid gain",
+        "min": -18.0,
+        "max": 18.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "q2",
+        "name": "Low-mid Q",
+        "min": 0.3,
+        "max": 8.0,
+        "default": 1.0,
+        "unit": "",
+        "scale": "log"
+      },
+      {
+        "key": "f3",
+        "name": "Mid freq",
+        "min": 300.0,
+        "max": 6000.0,
+        "default": 1500.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "g3",
+        "name": "Mid gain",
+        "min": -18.0,
+        "max": 18.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "q3",
+        "name": "Mid Q",
+        "min": 0.3,
+        "max": 8.0,
+        "default": 1.0,
+        "unit": "",
+        "scale": "log"
+      },
+      {
+        "key": "f4",
+        "name": "High-mid freq",
+        "min": 1000.0,
+        "max": 16000.0,
+        "default": 4000.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "g4",
+        "name": "High-mid gain",
+        "min": -18.0,
+        "max": 18.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "q4",
+        "name": "High-mid Q",
+        "min": 0.3,
+        "max": 8.0,
+        "default": 1.0,
+        "unit": "",
+        "scale": "log"
+      },
+      {
+        "key": "f5",
+        "name": "High freq",
+        "min": 2000.0,
+        "max": 20000.0,
+        "default": 10000.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "g5",
+        "name": "High gain",
+        "min": -18.0,
+        "max": 18.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "gate",
+    "name": "Noise gate",
+    "stage": "both",
+    "params": [
+      {
+        "key": "threshold",
+        "name": "Threshold",
+        "min": -80.0,
+        "max": 0.0,
+        "default": -50.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "attack",
+        "name": "Attack",
+        "min": 0.1,
+        "max": 50.0,
+        "default": 1.0,
+        "unit": "ms",
+        "scale": "log"
+      },
+      {
+        "key": "hold",
+        "name": "Hold",
+        "min": 0.0,
+        "max": 500.0,
+        "default": 80.0,
+        "unit": "ms",
+        "scale": "linear"
+      },
+      {
+        "key": "release",
+        "name": "Release",
+        "min": 5.0,
+        "max": 1000.0,
+        "default": 150.0,
+        "unit": "ms",
+        "scale": "log"
+      },
+      {
+        "key": "range",
+        "name": "Range",
+        "min": -80.0,
+        "max": 0.0,
+        "default": -60.0,
+        "unit": "dB",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "compressor",
+    "name": "Compressor",
+    "stage": "output",
+    "params": [
+      {
+        "key": "threshold",
+        "name": "Threshold",
+        "min": -60.0,
+        "max": 0.0,
+        "default": -18.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "ratio",
+        "name": "Ratio",
+        "min": 1.0,
+        "max": 20.0,
+        "default": 3.0,
+        "unit": ":1",
+        "scale": "log"
+      },
+      {
+        "key": "attack",
+        "name": "Attack",
+        "min": 0.1,
+        "max": 100.0,
+        "default": 5.0,
+        "unit": "ms",
+        "scale": "log"
+      },
+      {
+        "key": "release",
+        "name": "Release",
+        "min": 10.0,
+        "max": 1000.0,
+        "default": 120.0,
+        "unit": "ms",
+        "scale": "log"
+      },
+      {
+        "key": "knee",
+        "name": "Knee",
+        "min": 0.0,
+        "max": 24.0,
+        "default": 6.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "makeup",
+        "name": "Makeup",
+        "min": 0.0,
+        "max": 24.0,
+        "default": 0.0,
+        "unit": "dB",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "deesser",
+    "name": "De-esser",
+    "stage": "output",
+    "params": [
+      {
+        "key": "freq",
+        "name": "Frequency",
+        "min": 4000.0,
+        "max": 10000.0,
+        "default": 6000.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "threshold",
+        "name": "Threshold",
+        "min": -60.0,
+        "max": 0.0,
+        "default": -30.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "reduction",
+        "name": "Max reduction",
+        "min": 0.0,
+        "max": 24.0,
+        "default": 8.0,
+        "unit": "dB",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "reverb",
+    "name": "Reverb",
+    "stage": "output",
+    "params": [
+      {
+        "key": "size",
+        "name": "Size",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.5,
+        "unit": "",
+        "scale": "linear"
+      },
+      {
+        "key": "damping",
+        "name": "Damping",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.5,
+        "unit": "",
+        "scale": "linear"
+      },
+      {
+        "key": "predelay",
+        "name": "Pre-delay",
+        "min": 0.0,
+        "max": 100.0,
+        "default": 10.0,
+        "unit": "ms",
+        "scale": "linear"
+      },
+      {
+        "key": "mix",
+        "name": "Mix",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.2,
+        "unit": "",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "chorus",
+    "name": "Chorus",
+    "stage": "output",
+    "params": [
+      {
+        "key": "rate",
+        "name": "Rate",
+        "min": 0.05,
+        "max": 5.0,
+        "default": 0.8,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "depth",
+        "name": "Depth",
+        "min": 0.1,
+        "max": 10.0,
+        "default": 3.0,
+        "unit": "ms",
+        "scale": "linear"
+      },
+      {
+        "key": "delay",
+        "name": "Delay",
+        "min": 5.0,
+        "max": 30.0,
+        "default": 12.0,
+        "unit": "ms",
+        "scale": "linear"
+      },
+      {
+        "key": "feedback",
+        "name": "Feedback",
+        "min": 0.0,
+        "max": 0.9,
+        "default": 0.1,
+        "unit": "",
+        "scale": "linear"
+      },
+      {
+        "key": "mix",
+        "name": "Mix",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 0.35,
+        "unit": "",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "lofi",
+    "name": "Lo-fi mic",
+    "stage": "output",
+    "params": [
+      {
+        "key": "low",
+        "name": "Low cut",
+        "min": 50.0,
+        "max": 2000.0,
+        "default": 300.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "high",
+        "name": "High cut",
+        "min": 1000.0,
+        "max": 16000.0,
+        "default": 3400.0,
+        "unit": "Hz",
+        "scale": "log"
+      },
+      {
+        "key": "drive",
+        "name": "Drive",
+        "min": 0.0,
+        "max": 30.0,
+        "default": 6.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "bits",
+        "name": "Bits",
+        "min": 2.0,
+        "max": 16.0,
+        "default": 10.0,
+        "unit": "",
+        "scale": "linear"
+      },
+      {
+        "key": "downsample",
+        "name": "Downsample",
+        "min": 1.0,
+        "max": 32.0,
+        "default": 3.0,
+        "unit": "x",
+        "scale": "log"
+      },
+      {
+        "key": "noise",
+        "name": "Noise",
+        "min": -90.0,
+        "max": -20.0,
+        "default": -62.0,
+        "unit": "dB",
+        "scale": "linear"
+      },
+      {
+        "key": "mix",
+        "name": "Mix",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 1.0,
+        "unit": "",
+        "scale": "linear"
+      }
+    ]
+  },
+  {
+    "kind": "denoise",
+    "name": "Noise suppression",
+    "stage": "input",
+    "params": [
+      {
+        "key": "amount",
+        "name": "Amount",
+        "min": 0.0,
+        "max": 1.0,
+        "default": 1.0,
+        "unit": "",
+        "scale": "linear"
+      }
+    ]
+  }
+]

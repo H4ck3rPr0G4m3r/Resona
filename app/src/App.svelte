@@ -7,7 +7,7 @@
   import TopBar from "./components/TopBar.svelte";
   import Library from "./components/Library.svelte";
   import LiveView from "./components/LiveView.svelte";
-  import Routing from "./components/Routing.svelte";
+  import ChainStrip from "./components/ChainStrip.svelte";
   import SettingsDrawer from "./components/SettingsDrawer.svelte";
   import { store } from "./lib/store.svelte";
 
@@ -36,7 +36,7 @@
   <main class="center">
     {#if store.ready}<LiveView />{:else}<div class="skeleton" aria-hidden="true"><span></span><span></span><span></span></div>{/if}
   </main>
-  <Routing />
+  <ChainStrip />
 </div>
 
 {#if store.settingsOpen}<SettingsDrawer />{/if}
@@ -64,7 +64,7 @@
   .app {
     display: grid;
     grid-template-columns: 272px minmax(0, 1fr);
-    grid-template-rows: 48px minmax(0, 1fr) 52px;
+    grid-template-rows: 48px minmax(0, 1fr) auto;
     grid-template-areas:
       "bar bar"
       "rail center"

@@ -3,6 +3,7 @@
 // main.ts only imports it when there is no Tauri runtime. Data here is sample data.
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
+import catalog from "./devcatalog.json";
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get("state") ?? "stopped";
@@ -87,11 +88,29 @@ export function install() {
       const a = (args ?? {}) as Record<string, unknown>;
       switch (cmd) {
         case "list_devices": return devices;
+        case "fx_catalog": return catalog;
+        case "fx_set": case "fx_param": return null;
         case "get_status": return { state, message: null, engine_dir: "C:/Resona/engine" };
         case "settings_load":
-          return { output_device: "line1", calibration: { block_ms: 40, gpu: "NVIDIA GeForce RTX 3060 Ti", at: 0 }, last_voice: library[0]?.id ?? null };
+          return {
+            output_device: "line1", calibration: { block_ms: 40, gpu: "NVIDIA GeForce RTX 3060 Ti", at: 0 }, last_voice: library[0]?.id ?? null,
+            ...(params.has("fx") ? { fx: {
+              input: { slots: [
+                { id: 1, kind: "gain", enabled: true, params: { gain: 3 } },
+                { id: 2, kind: "filter", enabled: true, params: { mode: 1, freq: 70, q: 0.707, slope: 0 } },
+                { id: 3, kind: "denoise", enabled: true, params: { amount: 1 } },
+              ] },
+              output: { slots: [
+                { id: 4, kind: "eq", enabled: true, params: { f1: 120, g1: 3, f2: 400, g2: -2.5, q2: 1.2, f3: 1800, g3: 0, q3: 1, f4: 4500, g4: 4, q4: 1.4, f5: 11000, g5: 2 } },
+                { id: 5, kind: "compressor", enabled: true, params: {} },
+                { id: 6, kind: "reverb", enabled: false, params: {} },
+              ] },
+              gate: { enabled: true, threshold: 0.6, hold_ms: 200, release_ms: 300, range_db: -45 },
+              limiter: { enabled: true, ceiling_db: -1 }, singing: false,
+            } } : {}),
+          };
         case "settings_save": case "profile_save": return null;
-        case "profile_load": return { pitch: 5, formant: 0, index_rate: 0.5, protect: 0.33 };
+        case "profile_load": return { pitch: 5, formant: 0, index_rate: 0.5, protect: 0.33, chain: null };
         case "library_list": return library;
         case "library_update": {
           const v = library.find((x) => x.id === a.id)!;

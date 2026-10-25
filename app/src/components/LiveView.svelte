@@ -179,8 +179,7 @@
     display: flex;
     flex-direction: column;
     gap: 18px;
-    height: 100%;
-    min-height: 0;
+    min-height: 100%;
     padding: 20px 22px 18px;
   }
   .voice {
@@ -253,11 +252,11 @@
     }
   }
   .body {
-    flex: 1;
+    /* Fills spare height, but never shrinks under its content: the center scrolls instead. */
+    flex: 1 0 auto;
     display: grid;
     grid-template-columns: minmax(300px, 380px) 1fr;
     gap: 22px;
-    min-height: 0;
   }
   .controls {
     display: grid;

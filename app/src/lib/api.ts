@@ -85,6 +85,7 @@ export interface Latency {
   lookahead_ms: number;
   compute_ms: number;
   buffer_ms: number;
+  effects_ms?: number;
   output_ms: number;
   total_ms: number;
 }
@@ -103,6 +104,7 @@ export interface Stats {
   underruns?: number;
   fifo_ms?: number;
   sola_ncc?: number;
+  gate_open?: boolean;
   devices?: {
     input: { device_name: string; mode: string; latency_ms: number };
     output: { device_name: string; mode: string; latency_ms: number };
@@ -140,6 +142,52 @@ export interface ImportReport {
 export interface Binding {
   accel: string;
   action: string;
+}
+
+export type ParamScale = "linear" | "log" | { choice: string[] };
+
+export interface ParamSpec {
+  key: string;
+  name: string;
+  min: number;
+  max: number;
+  default: number;
+  unit: string;
+  scale: ParamScale;
+}
+
+export interface KindSpec {
+  kind: string;
+  name: string;
+  stage: "input" | "output" | "both";
+  params: ParamSpec[];
+}
+
+export interface SlotSpec {
+  id: number;
+  kind: string;
+  enabled: boolean;
+  params: Record<string, number>;
+}
+
+export interface ChainSpec {
+  slots: SlotSpec[];
+}
+
+export interface GateParams {
+  enabled: boolean;
+  threshold: number;
+  hold_ms: number;
+  release_ms: number;
+  range_db: number;
+}
+
+export interface FxSettings {
+  input: ChainSpec;
+  output: ChainSpec;
+  gate: GateParams;
+  limiter: { enabled: boolean; ceiling_db: number };
+  singing: boolean;
 }
 
 export type RuntimeEvent =
@@ -182,6 +230,12 @@ export const api = {
   setShellPrefs: (closeToTray: boolean, autostart: boolean) =>
     invoke<void>("set_shell_prefs", { closeToTray, autostart }),
   launchedMinimized: () => invoke<boolean>("launched_minimized"),
+  fxCatalog: () => invoke<KindSpec[]>("fx_catalog"),
+  fxSet: (settings: FxSettings) => invoke<void>("fx_set", { settings }),
+  fxParam: (chain: "input" | "output", slot: number, key: string, value: number) =>
+    invoke<void>("fx_param", { chain, slot, key, value }),
+  chainExport: (path: string, chain: ChainSpec) => invoke<void>("chain_export", { path, chain }),
+  chainImport: (path: string) => invoke<ChainSpec>("chain_import", { path }),
   onEvent: (cb: (e: RuntimeEvent) => void): Promise<UnlistenFn> =>
     listen<RuntimeEvent>("resona", (e) => cb(e.payload)),
   onImport: (cb: (p: { done: number; total: number; name: string | null }) => void) =>

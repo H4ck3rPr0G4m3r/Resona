@@ -52,6 +52,8 @@ fn stub_engine_soak_has_no_underruns() {
     let mut next = start;
     let mut underruns_after_warmup = 0;
     let warmup = Duration::from_secs(1);
+    let mut chain_set = false;
+    let mut after_gain: Vec<f32> = Vec::new();
     while start.elapsed() < Duration::from_secs(secs) {
         next += Duration::from_millis(10);
         spin_until(next);
@@ -68,6 +70,16 @@ fn stub_engine_soak_has_no_underruns() {
         if start.elapsed() > Duration::from_secs(2) && rendered.len() < 48000 {
             rendered.extend_from_slice(&out);
         }
+        // Then put a -6 dB output gain in the chain (live, crossfaded) and check it lands.
+        if start.elapsed() > Duration::from_secs(4) && !chain_set {
+            chain_set = true;
+            let mut fx = shared.fx.settings();
+            fx.output = serde_json::from_value(json!({"slots": [{"id": 1, "kind": "gain", "params": {"gain": -6.0}}]})).unwrap();
+            shared.fx.update(fx).unwrap();
+        }
+        if start.elapsed() > Duration::from_secs(5) && after_gain.len() < 24000 {
+            after_gain.extend_from_slice(&out);
+        }
     }
     shared.stop.store(true, Ordering::Release);
     parts.dsp.join().unwrap();
@@ -80,4 +92,8 @@ fn stub_engine_soak_has_no_underruns() {
     let max_step = rendered.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
     let clean_step = 0.3 * 2.0 * std::f32::consts::PI * 440.0 / 48000.0;
     assert!(max_step < clean_step * 1.5, "discontinuity in output: {max_step} vs {clean_step}");
+    if !after_gain.is_empty() {
+        let rms2 = (after_gain.iter().map(|v| v * v).sum::<f32>() / after_gain.len() as f32).sqrt();
+        assert!((rms2 / rms - 0.501).abs() < 0.03, "output chain gain not applied: {}", rms2 / rms);
+    }
 }

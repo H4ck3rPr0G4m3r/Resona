@@ -4,13 +4,18 @@ import {
   type CalibrationResult,
   type DeviceInfo,
   type EngineState,
+  type ChainSpec,
   type ImportReport,
+  type KindSpec,
   type LibraryVoice,
   type Stats,
 } from "./api";
 import { DEFAULT_PROFILE, DEFAULT_SETTINGS, mergeDefaults, type Profile, type Settings } from "./settings";
 
 export const TRACE_FRAMES = 500; // 5 s at 100 fps
+
+export type ChainName = "input" | "output";
+export type FxTarget = { chain: ChainName; id: number } | { special: "gate" | "limiter" } | null;
 
 export interface Notice {
   id: number;
@@ -48,6 +53,8 @@ class Store {
   settingsTab = $state<"devices" | "performance" | "pipeline" | "hotkeys" | "app">("devices");
   hotkeyErrors = $state<{ accel: string; action: string; error: string }[]>([]);
   logTail = $state<string[]>([]);
+  catalog = $state<KindSpec[]>([]);
+  fxEditing = $state<FxTarget>(null);
   /** Recent underrun count (last ~10 s), for the dropout warning. */
   recentUnderruns = $state(0);
 
@@ -76,6 +83,7 @@ class Store {
     this.applyTheme();
     await Promise.all([this.refreshDevices(), this.refreshLibrary()]);
     this.muted = await api.getMuted().catch(() => false);
+    this.catalog = await api.fxCatalog().catch(() => []);
     const st = await api.status().catch(() => null);
     if (st) this.engine = { state: st.state, message: st.message };
 
@@ -109,6 +117,7 @@ class Store {
     const first = this.library.find((v) => v.id === last) ?? this.ordered[0] ?? null;
     if (first) await this.selectIdle(first.id);
     await this.applyShell();
+    await this.pushFxNow();
     this.ready = true;
     if (this.settings.start_on_launch && this.selected) this.start();
   }
@@ -174,8 +183,112 @@ class Store {
 
   /** Engine params for a session: profile + global F0 post settings. */
   private params(p: Profile) {
-    const { schema: _s, ...rest } = p;
+    const { schema: _s, chain: _c, ...rest } = p;
     return { ...rest, ...this.settings.f0 };
+  }
+
+  // -- effects --------------------------------------------------------------------------------
+  /** The output chain in force: the selected voice's own chain, else the global one. */
+  outputChain = $derived(this.profile.chain ?? this.settings.fx.output);
+  voiceHasChain = $derived(this.profile.chain !== null);
+
+  chain(name: ChainName): ChainSpec {
+    return name === "input" ? this.settings.fx.input : this.outputChain;
+  }
+
+  kind(kind: string) {
+    return this.catalog.find((k) => k.kind === kind);
+  }
+
+  private async pushFxNow() {
+    const fx = { ...$state.snapshot(this.settings.fx), output: $state.snapshot(this.outputChain) };
+    await api.fxSet(fx).catch((e) => this.notify("error", `Effects not applied: ${e}`));
+  }
+
+  private pushFx = debounce(() => this.pushFxNow(), 40);
+
+  /** Persist whichever object owns the edited chain. */
+  private persistChain(name: ChainName) {
+    if (name === "output" && this.profile.chain && this.selectedId) {
+      this.persistProfile(this.selectedId, $state.snapshot(this.profile));
+    } else {
+      this.saveSettings();
+    }
+  }
+
+  private editChain(name: ChainName, f: (c: ChainSpec) => void) {
+    const c = name === "input" ? this.settings.fx.input : (this.profile.chain ?? this.settings.fx.output);
+    f(c);
+    this.persistChain(name);
+    this.pushFx();
+  }
+
+  addSlot(name: ChainName, kind: string) {
+    const k = this.kind(kind);
+    if (!k) return;
+    const ids = [...this.settings.fx.input.slots, ...this.outputChain.slots].map((s) => s.id);
+    const id = Math.max(0, ...ids) + 1;
+    const params = Object.fromEntries(k.params.map((p) => [p.key, p.default]));
+    this.editChain(name, (c) => c.slots.push({ id, kind, enabled: true, params }));
+    this.fxEditing = { chain: name, id };
+  }
+
+  removeSlot(name: ChainName, id: number) {
+    this.editChain(name, (c) => (c.slots = c.slots.filter((s) => s.id !== id)));
+    if (this.fxEditing && "id" in this.fxEditing && this.fxEditing.id === id) this.fxEditing = null;
+  }
+
+  toggleSlot(name: ChainName, id: number) {
+    this.editChain(name, (c) => {
+      const s = c.slots.find((x) => x.id === id);
+      if (s) s.enabled = !s.enabled;
+    });
+  }
+
+  moveSlot(name: ChainName, from: number, to: number) {
+    if (from === to) return;
+    this.editChain(name, (c) => {
+      const [s] = c.slots.splice(from, 1);
+      c.slots.splice(to, 0, s);
+    });
+  }
+
+  setSlotParam(name: ChainName, id: number, key: string, value: number) {
+    const c = name === "input" ? this.settings.fx.input : (this.profile.chain ?? this.settings.fx.output);
+    const s = c.slots.find((x) => x.id === id);
+    if (!s) return;
+    s.params[key] = value;
+    this.persistChain(name);
+    api.fxParam(name, id, key, value).catch(() => {});
+  }
+
+  setGate(patch: Partial<Settings["fx"]["gate"]>) {
+    Object.assign(this.settings.fx.gate, patch);
+    this.saveSettings();
+    this.pushFx();
+  }
+
+  setLimiter(patch: Partial<Settings["fx"]["limiter"]>) {
+    Object.assign(this.settings.fx.limiter, patch);
+    this.saveSettings();
+    this.pushFx();
+  }
+
+  setSinging(on: boolean) {
+    this.settings.fx.singing = on;
+    this.saveSettings();
+    this.pushFx();
+  }
+
+  /** Give the selected voice its own output chain (starting from the global one), or drop it. */
+  setVoiceChain(own: boolean) {
+    this.profile.chain = own ? structuredClone($state.snapshot(this.settings.fx.output)) : null;
+    if (this.selectedId) this.persistProfile(this.selectedId, $state.snapshot(this.profile));
+    this.pushFx();
+  }
+
+  replaceChain(name: ChainName, spec: ChainSpec) {
+    this.editChain(name, (c) => (c.slots = spec.slots));
   }
 
   // -- voices ---------------------------------------------------------------------------------
@@ -194,6 +307,7 @@ class Store {
     this.profile = profile;
     this.settings.last_voice = id;
     this.saveSettings();
+    this.pushFx();
     if (this.live) {
       try {
         await api.activateVoice(this.voiceRef(v), this.params(profile), this.settings.xfade_ms);

@@ -1,0 +1,523 @@
+//! Effect chains (48 kHz mono, in place).
+//!
+//! * Every effect exposes a static parameter table ([`KindSpec`]); the UI is generated from it.
+//! * Every continuous parameter is smoothed at audio rate (one-pole, ~20 ms), so moving a control
+//!   mid-speech never clicks; enabling/disabling a slot fades over 10 ms.
+//! * The audio thread owns a [`LiveChain`]. The control side ([`ChainControl`]) builds new chains
+//!   off the audio thread and hands them over through a lock-free ring; the old chain crossfades
+//!   out and is sent back to be freed on the control side, so the audio thread never allocates.
+
+pub mod biquad;
+mod dynamics;
+mod lofi;
+mod space;
+mod svf;
+mod tone;
+pub mod denoise;
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+
+pub use biquad::SR;
+
+pub const MAX_CHUNK: usize = 512;
+const FADE: usize = 480; // 10 ms enable/disable fade
+const SWAP_FADE: usize = 960; // 20 ms chain swap crossfade
+
+/// One-pole parameter smoother, ~20 ms time constant at 48 kHz.
+#[derive(Clone, Copy, Debug)]
+pub struct Smooth {
+    pub cur: f32,
+    pub target: f32,
+}
+
+impl Smooth {
+    const K: f32 = 1.0 - 0.998_959_4; // 1 - exp(-1 / (0.02 * 48000))
+    pub fn new(v: f32) -> Self {
+        Self { cur: v, target: v }
+    }
+    #[inline]
+    pub fn next(&mut self) -> f32 {
+        self.cur += (self.target - self.cur) * Self::K;
+        self.cur
+    }
+    /// Advance `n` samples at once (for per-block coefficient updates).
+    pub fn advance(&mut self, n: usize) -> f32 {
+        let k = 1.0 - (1.0 - Self::K).powi(n as i32);
+        self.cur += (self.target - self.cur) * k;
+        self.cur
+    }
+    pub fn settled(&self) -> bool {
+        (self.target - self.cur).abs() <= 1e-5 * (1.0 + self.target.abs())
+    }
+    pub fn snap(&mut self) {
+        self.cur = self.target;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Scale {
+    Linear,
+    Log,
+    /// Discrete choices; the value is the index.
+    Choice(&'static [&'static str]),
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ParamSpec {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub unit: &'static str,
+    pub scale: Scale,
+}
+
+const fn p(key: &'static str, name: &'static str, min: f32, max: f32, default: f32, unit: &'static str) -> ParamSpec {
+    ParamSpec { key, name, min, max, default, unit, scale: Scale::Linear }
+}
+const fn plog(key: &'static str, name: &'static str, min: f32, max: f32, default: f32, unit: &'static str) -> ParamSpec {
+    ParamSpec { key, name, min, max, default, unit, scale: Scale::Log }
+}
+const fn pchoice(key: &'static str, name: &'static str, choices: &'static [&'static str], default: f32) -> ParamSpec {
+    ParamSpec { key, name, min: 0.0, max: (choices.len() - 1) as f32, default, unit: "", scale: Scale::Choice(choices) }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Input,
+    Output,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct KindSpec {
+    pub kind: &'static str,
+    pub name: &'static str,
+    pub stage: Stage,
+    pub params: &'static [ParamSpec],
+}
+
+pub static CATALOG: &[KindSpec] = &[
+    KindSpec { kind: "gain", name: "Gain", stage: Stage::Both, params: &[p("gain", "Gain", -24.0, 24.0, 0.0, "dB")] },
+    KindSpec {
+        kind: "filter",
+        name: "Filter",
+        stage: Stage::Both,
+        params: &[
+            pchoice("mode", "Type", &["Low-pass", "High-pass"], 0.0),
+            plog("freq", "Cutoff", 20.0, 20_000.0, 8_000.0, "Hz"),
+            plog("q", "Resonance", 0.5, 12.0, 0.707, ""),
+            pchoice("slope", "Slope", &["12 dB/oct", "24 dB/oct"], 0.0),
+        ],
+    },
+    KindSpec {
+        kind: "eq",
+        name: "Equalizer",
+        stage: Stage::Output,
+        params: &[
+            plog("f1", "Low freq", 20.0, 500.0, 100.0, "Hz"),
+            p("g1", "Low gain", -18.0, 18.0, 0.0, "dB"),
+            plog("f2", "Low-mid freq", 100.0, 2_000.0, 400.0, "Hz"),
+            p("g2", "Low-mid gain", -18.0, 18.0, 0.0, "dB"),
+            plog("q2", "Low-mid Q", 0.3, 8.0, 1.0, ""),
+            plog("f3", "Mid freq", 300.0, 6_000.0, 1_500.0, "Hz"),
+            p("g3", "Mid gain", -18.0, 18.0, 0.0, "dB"),
+            plog("q3", "Mid Q", 0.3, 8.0, 1.0, ""),
+            plog("f4", "High-mid freq", 1_000.0, 16_000.0, 4_000.0, "Hz"),
+            p("g4", "High-mid gain", -18.0, 18.0, 0.0, "dB"),
+            plog("q4", "High-mid Q", 0.3, 8.0, 1.0, ""),
+            plog("f5", "High freq", 2_000.0, 20_000.0, 10_000.0, "Hz"),
+            p("g5", "High gain", -18.0, 18.0, 0.0, "dB"),
+        ],
+    },
+    KindSpec {
+        kind: "gate",
+        name: "Noise gate",
+        stage: Stage::Both,
+        params: &[
+            p("threshold", "Threshold", -80.0, 0.0, -50.0, "dB"),
+            plog("attack", "Attack", 0.1, 50.0, 1.0, "ms"),
+            p("hold", "Hold", 0.0, 500.0, 80.0, "ms"),
+            plog("release", "Release", 5.0, 1_000.0, 150.0, "ms"),
+            p("range", "Range", -80.0, 0.0, -60.0, "dB"),
+        ],
+    },
+    KindSpec {
+        kind: "compressor",
+        name: "Compressor",
+        stage: Stage::Output,
+        params: &[
+            p("threshold", "Threshold", -60.0, 0.0, -18.0, "dB"),
+            plog("ratio", "Ratio", 1.0, 20.0, 3.0, ":1"),
+            plog("attack", "Attack", 0.1, 100.0, 5.0, "ms"),
+            plog("release", "Release", 10.0, 1_000.0, 120.0, "ms"),
+            p("knee", "Knee", 0.0, 24.0, 6.0, "dB"),
+            p("makeup", "Makeup", 0.0, 24.0, 0.0, "dB"),
+        ],
+    },
+    KindSpec {
+        kind: "deesser",
+        name: "De-esser",
+        stage: Stage::Output,
+        params: &[
+            plog("freq", "Frequency", 4_000.0, 10_000.0, 6_000.0, "Hz"),
+            p("threshold", "Threshold", -60.0, 0.0, -30.0, "dB"),
+            p("reduction", "Max reduction", 0.0, 24.0, 8.0, "dB"),
+        ],
+    },
+    KindSpec {
+        kind: "reverb",
+        name: "Reverb",
+        stage: Stage::Output,
+        params: &[
+            p("size", "Size", 0.0, 1.0, 0.5, ""),
+            p("damping", "Damping", 0.0, 1.0, 0.5, ""),
+            p("predelay", "Pre-delay", 0.0, 100.0, 10.0, "ms"),
+            p("mix", "Mix", 0.0, 1.0, 0.2, ""),
+        ],
+    },
+    KindSpec {
+        kind: "chorus",
+        name: "Chorus",
+        stage: Stage::Output,
+        params: &[
+            plog("rate", "Rate", 0.05, 5.0, 0.8, "Hz"),
+            p("depth", "Depth", 0.1, 10.0, 3.0, "ms"),
+            p("delay", "Delay", 5.0, 30.0, 12.0, "ms"),
+            p("feedback", "Feedback", 0.0, 0.9, 0.1, ""),
+            p("mix", "Mix", 0.0, 1.0, 0.35, ""),
+        ],
+    },
+    KindSpec {
+        kind: "lofi",
+        name: "Lo-fi mic",
+        stage: Stage::Output,
+        params: &[
+            plog("low", "Low cut", 50.0, 2_000.0, 300.0, "Hz"),
+            plog("high", "High cut", 1_000.0, 16_000.0, 3_400.0, "Hz"),
+            p("drive", "Drive", 0.0, 30.0, 6.0, "dB"),
+            p("bits", "Bits", 2.0, 16.0, 10.0, ""),
+            plog("downsample", "Downsample", 1.0, 32.0, 3.0, "x"),
+            p("noise", "Noise", -90.0, -20.0, -62.0, "dB"),
+            p("mix", "Mix", 0.0, 1.0, 1.0, ""),
+        ],
+    },
+    KindSpec {
+        kind: "denoise",
+        name: "Noise suppression",
+        stage: Stage::Input,
+        params: &[p("amount", "Amount", 0.0, 1.0, 1.0, "")],
+    },
+];
+
+pub fn spec(kind: &str) -> Option<&'static KindSpec> {
+    CATALOG.iter().find(|k| k.kind == kind)
+}
+
+/// A processor. Parameters are addressed by their index in the kind's [`ParamSpec`] table.
+pub trait Effect: Send {
+    fn set(&mut self, idx: usize, value: f32);
+    fn process(&mut self, x: &mut [f32]);
+    fn reset(&mut self);
+    /// Constant latency in samples (the chain delays the dry path to match).
+    fn latency(&self) -> usize {
+        0
+    }
+}
+
+pub fn create(kind: &str) -> Option<Box<dyn Effect>> {
+    let fx: Box<dyn Effect> = match kind {
+        "gain" => Box::new(tone::Gain::new()),
+        "filter" => Box::new(tone::Filter::new()),
+        "eq" => Box::new(tone::Eq5::new()),
+        "gate" => Box::new(dynamics::Gate::new()),
+        "compressor" => Box::new(dynamics::Compressor::new()),
+        "deesser" => Box::new(dynamics::DeEsser::new()),
+        "reverb" => Box::new(space::Reverb::new()),
+        "chorus" => Box::new(space::Chorus::new()),
+        "lofi" => Box::new(lofi::LoFi::new()),
+        "denoise" => Box::new(denoise::Denoise::new()),
+        _ => return None,
+    };
+    let mut fx = fx;
+    for (i, ps) in spec(kind)?.params.iter().enumerate() {
+        fx.set(i, ps.default);
+    }
+    fx.reset(); // start settled at the defaults
+    Some(fx)
+}
+
+pub use dynamics::Limiter;
+
+// -- chain ---------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SlotSpec {
+    pub id: u64,
+    pub kind: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub params: BTreeMap<String, f32>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChainSpec {
+    #[serde(default)]
+    pub slots: Vec<SlotSpec>,
+}
+
+struct Slot {
+    id: u64,
+    fx: Box<dyn Effect>,
+    mix: Smooth,
+    dry: Vec<f32>,
+    delay: Vec<f32>, // dry-path delay line for effects with latency
+    dpos: usize,
+}
+
+pub struct Chain {
+    slots: Vec<Slot>,
+}
+
+impl Chain {
+    pub fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    pub fn build(spec: &ChainSpec) -> Result<Self, String> {
+        let mut slots = Vec::with_capacity(spec.slots.len());
+        for s in &spec.slots {
+            let ks = self::spec(&s.kind).ok_or_else(|| format!("unknown effect '{}'", s.kind))?;
+            let mut fx = create(&s.kind).expect("catalog and create agree");
+            for (k, v) in &s.params {
+                let i = ks.params.iter().position(|p| p.key == k).ok_or_else(|| format!("{}: unknown parameter '{k}'", s.kind))?;
+                let ps = &ks.params[i];
+                fx.set(i, v.clamp(ps.min, ps.max));
+            }
+            fx.reset();
+            let lat = fx.latency();
+            slots.push(Slot {
+                id: s.id,
+                fx,
+                mix: Smooth::new(if s.enabled { 1.0 } else { 0.0 }),
+                dry: vec![0.0; MAX_CHUNK],
+                delay: vec![0.0; lat.max(1)],
+                dpos: 0,
+            });
+        }
+        Ok(Self { slots })
+    }
+
+    pub fn latency(&self) -> usize {
+        self.slots.iter().map(|s| s.fx.latency()).sum()
+    }
+
+    pub fn set_param(&mut self, id: u64, idx: usize, v: f32) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.id == id) {
+            s.fx.set(idx, v);
+        }
+    }
+
+    pub fn set_enabled(&mut self, id: u64, on: bool) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.id == id) {
+            s.mix.target = if on { 1.0 } else { 0.0 };
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for s in &mut self.slots {
+            s.fx.reset();
+            s.delay.fill(0.0);
+        }
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        for chunk in buf.chunks_mut(MAX_CHUNK) {
+            for s in &mut self.slots {
+                s.process(chunk);
+            }
+        }
+    }
+}
+
+impl Slot {
+    fn process(&mut self, x: &mut [f32]) {
+        let lat = self.fx.latency();
+        let off = self.mix.target == 0.0 && self.mix.cur < 1e-4;
+        if off && lat == 0 {
+            self.mix.cur = 0.0;
+            return; // bypassed and silent-switchable: skip the work entirely
+        }
+        let n = x.len();
+        // Dry copy, delayed by the effect's latency so blending stays aligned.
+        if lat > 0 {
+            for i in 0..n {
+                let d = self.delay[self.dpos];
+                self.delay[self.dpos] = x[i];
+                self.dpos = (self.dpos + 1) % lat;
+                self.dry[i] = d;
+            }
+        } else {
+            self.dry[..n].copy_from_slice(x);
+        }
+        self.fx.process(x);
+        let k = 1.0 / FADE as f32;
+        if self.mix.cur == 1.0 && self.mix.target == 1.0 {
+            return;
+        }
+        for i in 0..n {
+            let m = &mut self.mix;
+            m.cur = if m.target > m.cur { (m.cur + k).min(m.target) } else { (m.cur - k).max(m.target) };
+            x[i] = self.dry[i] + (x[i] - self.dry[i]) * m.cur;
+        }
+    }
+}
+
+// -- live handoff ----------------------------------------------------------------------------------
+
+pub enum ChainMsg {
+    Swap(Box<Chain>),
+    Param { id: u64, idx: usize, value: f32 },
+    Enable { id: u64, on: bool },
+}
+
+/// Audio-thread side.
+pub struct LiveChain {
+    cur: Box<Chain>,
+    old: Option<Box<Chain>>,
+    fade: usize,
+    rx: rtrb::Consumer<ChainMsg>,
+    trash: rtrb::Producer<Box<Chain>>,
+    tmp: Vec<f32>,
+}
+
+/// Control side: build/patch chains from any thread.
+pub struct ChainControl {
+    tx: Mutex<rtrb::Producer<ChainMsg>>,
+    trash: Mutex<rtrb::Consumer<Box<Chain>>>,
+    spec: Mutex<ChainSpec>,
+}
+
+pub fn live_chain() -> (LiveChain, Arc<ChainControl>) {
+    let (tx, rx) = rtrb::RingBuffer::new(256);
+    let (ttx, trx) = rtrb::RingBuffer::new(8);
+    (
+        LiveChain { cur: Box::new(Chain::empty()), old: None, fade: 0, rx, trash: ttx, tmp: vec![0.0; MAX_CHUNK] },
+        Arc::new(ChainControl { tx: Mutex::new(tx), trash: Mutex::new(trx), spec: Mutex::new(ChainSpec::default()) }),
+    )
+}
+
+impl LiveChain {
+    pub fn latency(&self) -> usize {
+        self.cur.latency()
+    }
+
+    pub fn process(&mut self, buf: &mut [f32]) {
+        while let Ok(msg) = self.rx.pop() {
+            match msg {
+                ChainMsg::Swap(c) => {
+                    let prev = std::mem::replace(&mut self.cur, c);
+                    if let Some(o) = self.old.replace(prev) {
+                        let _ = self.trash.push(o); // a still-fading chain is dropped by the control side
+                    }
+                    self.fade = SWAP_FADE;
+                }
+                ChainMsg::Param { id, idx, value } => self.cur.set_param(id, idx, value),
+                ChainMsg::Enable { id, on } => self.cur.set_enabled(id, on),
+            }
+        }
+        if self.old.is_none() {
+            self.cur.process(buf);
+            return;
+        }
+        for chunk in buf.chunks_mut(MAX_CHUNK) {
+            let Some(old) = self.old.as_mut() else {
+                self.cur.process(chunk);
+                continue;
+            };
+            let n = chunk.len();
+            let tmp = &mut self.tmp[..n];
+            tmp.copy_from_slice(chunk);
+            old.process(tmp);
+            self.cur.process(chunk);
+            for i in 0..n {
+                let w = self.fade as f32 / SWAP_FADE as f32;
+                chunk[i] = chunk[i] * (1.0 - w) + tmp[i] * w;
+                self.fade = self.fade.saturating_sub(1);
+            }
+            if self.fade == 0 {
+                if let Some(o) = self.old.take() {
+                    let _ = self.trash.push(o);
+                }
+            }
+        }
+    }
+}
+
+impl ChainControl {
+    fn send(&self, msg: ChainMsg) {
+        // Free chains the audio thread is done with, here, off the audio thread.
+        while let Ok(c) = self.trash.lock().pop() {
+            drop(c);
+        }
+        let _ = self.tx.lock().push(msg);
+    }
+
+    pub fn spec(&self) -> ChainSpec {
+        self.spec.lock().clone()
+    }
+
+    /// Replace the whole chain. Structural changes rebuild (with a 20 ms crossfade); a spec that
+    /// only differs in parameter values or enable flags is patched in place instead.
+    pub fn set(&self, new: ChainSpec) -> Result<(), String> {
+        let mut cur = self.spec.lock();
+        let same_shape = cur.slots.len() == new.slots.len()
+            && cur.slots.iter().zip(&new.slots).all(|(a, b)| a.id == b.id && a.kind == b.kind);
+        if same_shape {
+            for (a, b) in cur.slots.iter().zip(&new.slots) {
+                let ks = spec(&b.kind).ok_or("unknown effect")?;
+                for (i, ps) in ks.params.iter().enumerate() {
+                    let va = a.params.get(ps.key).copied().unwrap_or(ps.default);
+                    let vb = b.params.get(ps.key).copied().unwrap_or(ps.default).clamp(ps.min, ps.max);
+                    if va != vb {
+                        self.send(ChainMsg::Param { id: b.id, idx: i, value: vb });
+                    }
+                }
+                if a.enabled != b.enabled {
+                    self.send(ChainMsg::Enable { id: b.id, on: b.enabled });
+                }
+            }
+        } else {
+            let chain = Chain::build(&new)?;
+            self.send(ChainMsg::Swap(Box::new(chain)));
+        }
+        *cur = new;
+        Ok(())
+    }
+
+    pub fn set_param(&self, id: u64, key: &str, value: f32) -> Result<(), String> {
+        let mut cur = self.spec.lock();
+        let slot = cur.slots.iter_mut().find(|s| s.id == id).ok_or("no such slot")?;
+        let ks = spec(&slot.kind).ok_or("unknown effect")?;
+        let idx = ks.params.iter().position(|p| p.key == key).ok_or("unknown parameter")?;
+        let v = value.clamp(ks.params[idx].min, ks.params[idx].max);
+        slot.params.insert(key.to_string(), v);
+        self.send(ChainMsg::Param { id, idx, value: v });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

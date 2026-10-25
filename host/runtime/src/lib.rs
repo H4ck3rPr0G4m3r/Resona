@@ -7,6 +7,7 @@
 //! DeviceLost (audio device error while running) → retry every 2 s → Running
 //! ```
 
+pub mod fx;
 pub mod pipeline;
 pub mod rpc;
 pub mod worker;
@@ -239,6 +240,7 @@ impl Runtime {
             let p50 = obj.get("p50_ms").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let (input_ms, output_ms) = sess.pipeline.as_ref().map(|p| (p.info.input.latency_ms, p.info.output.latency_ms)).unwrap_or((10.0, 10.0));
             let fifo_ms = s.fifo_samples.load(Ordering::Relaxed) as f32 / 48.0;
+            let fx_ms = (s.fx.input_latency.load(Ordering::Relaxed) + s.fx.output_latency.load(Ordering::Relaxed)) as f32 / 48.0;
             let jitter_ms = match s.jitter_samples.load(Ordering::Relaxed) {
                 0 => sess.cfg.jitter_ms,
                 n => n as f32 / 48.0,
@@ -249,13 +251,15 @@ impl Runtime {
                 "lookahead_ms": lookahead,
                 "compute_ms": p50,
                 "buffer_ms": jitter_ms,
+                "effects_ms": fx_ms,
                 "output_ms": output_ms + 1.0,
-                "total_ms": input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + output_ms + 1.0,
+                "total_ms": input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms + 1.0,
             });
             obj.insert("latency".into(), latency);
             obj.insert("underruns".into(), json!(s.underruns.load(Ordering::Relaxed)));
             obj.insert("fifo_ms".into(), json!(fifo_ms));
             obj.insert("sola_ncc".into(), json!(s.sola_ncc.load()));
+            obj.insert("gate_open".into(), json!(s.fx.gate_open.load(Ordering::Relaxed)));
             obj.insert("blocks_sent".into(), json!(s.blocks_sent.load(Ordering::Relaxed)));
             obj.insert("ring_full".into(), json!(s.ring_full.load(Ordering::Relaxed)));
             obj.insert("captured".into(), json!(s.captured.load(Ordering::Relaxed)));
@@ -364,6 +368,8 @@ impl Runtime {
 
     fn start_pipeline(&self, cfg: &SessionConfig, layout: Layout) -> Result<Pipeline> {
         let dev = DeviceConfig { input: cfg.input.clone(), output: cfg.output.clone(), monitor: cfg.monitor.clone(), jitter_ms: cfg.jitter_ms };
+        let lookahead_ms = cfg.stream.get("lookahead_ms").and_then(Value::as_f64).unwrap_or(40.0);
+        self.inner.shared.fx.lookahead.store((lookahead_ms * 48.0) as usize, Ordering::Relaxed);
         let rt = self.clone();
         let on_err = move |msg: String| rt.on_device_error(msg);
         Ok(Pipeline::start(self.inner.transport.clone(), self.inner.shared.clone(), layout, dev, on_err)?)
@@ -504,6 +510,27 @@ impl Runtime {
 
     pub fn set_monitor_gain_db(&self, db: f32) {
         self.inner.shared.monitor_gain.store(resona_dsp::from_db(db));
+    }
+
+    // -- effects ----------------------------------------------------------------------------
+
+    /// Effect catalog (kinds, parameter tables) for generating the chain editor.
+    pub fn fx_catalog() -> Value {
+        serde_json::to_value(resona_dsp::fx::CATALOG).unwrap_or(Value::Null)
+    }
+
+    pub fn fx_settings(&self) -> fx::FxSettings {
+        self.inner.shared.fx.settings()
+    }
+
+    /// Replace chains / gate / limiter / singing mode. Structural chain edits crossfade in 20 ms.
+    pub fn set_fx(&self, settings: fx::FxSettings) -> Result<()> {
+        self.inner.shared.fx.update(settings).map_err(RuntimeError::Other)
+    }
+
+    /// Fast path for dragging one control: no chain rebuild, no validation of the rest.
+    pub fn set_fx_param(&self, chain: &str, slot: u64, key: &str, value: f32) -> Result<()> {
+        self.inner.shared.fx.set_param(chain, slot, key, value).map_err(RuntimeError::Other)
     }
 
     pub fn set_down_mode(&self, m: DownMode) {

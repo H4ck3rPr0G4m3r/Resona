@@ -188,6 +188,39 @@ async fn library_import(app: AppHandle, st: State<'_, AppState>, paths: Vec<Stri
     .await
 }
 
+// -- effects ----------------------------------------------------------------------------------
+
+#[tauri::command]
+fn fx_catalog() -> Value {
+    Runtime::fx_catalog()
+}
+
+#[tauri::command]
+fn fx_set(st: State<'_, AppState>, settings: resona_runtime::fx::FxSettings) -> CmdResult<()> {
+    st.rt.set_fx(settings).map_err(err)
+}
+
+#[tauri::command]
+fn fx_param(st: State<'_, AppState>, chain: String, slot: u64, key: String, value: f32) -> CmdResult<()> {
+    st.rt.set_fx_param(&chain, slot, &key, value).map_err(err)
+}
+
+/// Write a chain preset (`.resona-chain.json`).
+#[tauri::command]
+fn chain_export(path: String, chain: resona_dsp::fx::ChainSpec) -> CmdResult<()> {
+    let v = json!({"schema": store::SCHEMA, "kind": "resona-chain", "chain": chain});
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).map_err(err)?).map_err(err)
+}
+
+/// Read and validate a chain preset.
+#[tauri::command]
+fn chain_import(path: String) -> CmdResult<resona_dsp::fx::ChainSpec> {
+    let v: Value = serde_json::from_slice(&std::fs::read(&path).map_err(err)?).map_err(|e| format!("not a chain preset: {e}"))?;
+    let chain: resona_dsp::fx::ChainSpec = serde_json::from_value(v.get("chain").cloned().unwrap_or(v)).map_err(|e| format!("not a chain preset: {e}"))?;
+    resona_dsp::fx::Chain::build(&chain)?;
+    Ok(chain)
+}
+
 // -- shell ------------------------------------------------------------------------------------
 
 #[tauri::command]
@@ -292,6 +325,11 @@ pub fn run() {
             apply_hotkeys,
             set_shell_prefs,
             launched_minimized,
+            fx_catalog,
+            fx_set,
+            fx_param,
+            chain_export,
+            chain_import,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Resona");

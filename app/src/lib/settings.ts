@@ -1,5 +1,5 @@
 // Shape of %APPDATA%\Resona\settings.json and profiles\<hash>.json (the shell persists them as-is).
-import type { DeviceMode, LiveParams, StreamSettings } from "./api";
+import type { ChainSpec, DeviceMode, FxSettings, LiveParams, StreamSettings } from "./api";
 
 export const SCHEMA = 1;
 
@@ -36,7 +36,23 @@ export interface Settings {
   autostart: boolean;
   start_on_launch: boolean;
   theme: "system" | "dark" | "light";
+  fx: FxSettings;
 }
+
+/** First-run chains: input gain, 70 Hz high-pass, noise suppression; empty output chain. */
+export const DEFAULT_FX: FxSettings = {
+  input: {
+    slots: [
+      { id: 1, kind: "gain", enabled: true, params: { gain: 0 } },
+      { id: 2, kind: "filter", enabled: true, params: { mode: 1, freq: 70, q: 0.707, slope: 0 } },
+      { id: 3, kind: "denoise", enabled: true, params: { amount: 1 } },
+    ],
+  },
+  output: { slots: [] },
+  gate: { enabled: false, threshold: 0.6, hold_ms: 200, release_ms: 300, range_db: -45 },
+  limiter: { enabled: true, ceiling_db: -1 },
+  singing: false,
+};
 
 export const DEFAULT_SETTINGS: Settings = {
   schema: SCHEMA,
@@ -63,12 +79,17 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   start_on_launch: false,
   theme: "system",
+  fx: DEFAULT_FX,
 };
 
 /** Per-voice profile: what selecting a voice restores. */
-export type Profile = Pick<LiveParams, "pitch" | "formant" | "index_rate" | "protect"> & { schema: number };
+export type Profile = Pick<LiveParams, "pitch" | "formant" | "index_rate" | "protect"> & {
+  schema: number;
+  /** Optional output chain used only while this voice is active. */
+  chain: ChainSpec | null;
+};
 
-export const DEFAULT_PROFILE: Profile = { schema: SCHEMA, pitch: 0, formant: 0, index_rate: 0.5, protect: 0.33 };
+export const DEFAULT_PROFILE: Profile = { schema: SCHEMA, pitch: 0, formant: 0, index_rate: 0.5, protect: 0.33, chain: null };
 
 /** Merge stored JSON over defaults, one level deep, ignoring keys of the wrong type. */
 export function mergeDefaults<T extends object>(defaults: T, stored: unknown): T {

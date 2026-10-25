@@ -3,6 +3,7 @@
 pub mod meter;
 pub mod resample;
 pub mod sola;
+pub mod fx;
 
 pub use meter::{AtomicF32, Meter, MeterState};
 pub use resample::Resampler;
