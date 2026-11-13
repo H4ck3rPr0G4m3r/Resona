@@ -136,6 +136,7 @@ class Synth(nn.Module):
         if half:
             model.half()
             model.dec.m_source.float()  # excitation stays fp32
+            model.dec.m_source.phase = model.dec.m_source.phase.double()
             model.z_noise = model.z_noise.float()
             model.resampler.float()
         return model
@@ -147,7 +148,7 @@ class Synth(nn.Module):
     def speaker(self, sid: int = 0) -> torch.Tensor:
         return self.emb_g(torch.tensor([sid], device=self.device)).unsqueeze(-1)
 
-    def z_noise_at(self, abs_frame0: int, n: int) -> torch.Tensor:
+    def z_noise_at(self, abs_frame0: int | torch.Tensor, n: int) -> torch.Tensor:
         idx = (torch.arange(n, device=self.device) + abs_frame0) % Z_NOISE_FRAMES
         return self.z_noise[:, idx].unsqueeze(0)
 
@@ -173,6 +174,14 @@ class Synth(nn.Module):
         noise = self.z_noise_at(abs_frame0 + flow_head, n_frames - flow_head).to(self.emb_g.weight.dtype)
         exc = self.dec.m_source(f0[dec_start : dec_start + dec_len], abs_frame0 + dec_start, commit_phase)
         return noise, exc, self.speaker(sid)
+
+    def prepare_step(self, n_frames, f0, abs_frame0: torch.Tensor, dec_start, dec_len, advance_frames: int):
+        """`prepare` for streaming, with the position as a long tensor: no CPU round trip, so it
+        can be captured in a CUDA graph. The speaker embedding is left to the caller."""
+        flow_head = max(dec_start - FLOW_CONTEXT, 0)
+        noise = self.z_noise_at(abs_frame0 + flow_head, n_frames - flow_head).to(self.emb_g.weight.dtype)
+        exc = self.dec.m_source.step(f0[dec_start : dec_start + dec_len], abs_frame0 + dec_start, advance_frames)
+        return noise, exc
 
     def core(self, phone, pitch, noise, exc, g, dec_start: int, dec_len: int) -> torch.Tensor:
         """Pure, fixed-shape part (enc_p → flow → decoder); safe to capture as a CUDA graph."""

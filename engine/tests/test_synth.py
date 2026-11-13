@@ -60,3 +60,19 @@ def test_source_noise_is_time_locked():
     assert torch.equal(a, b)
     c = src(f0, abs_frame0=6, commit=False)[0, 0]
     assert torch.allclose(a[400:], c[:-400])
+
+
+def test_source_step_matches_forward():
+    """The graph-safe streaming path agrees with `forward` over consecutive overlapping blocks,
+    and restarts from phase 0 when a call does not follow the previous one (like `forward`)."""
+    ref, dev = _source(), _source()
+    f0 = 150.0 + 60.0 * torch.sin(torch.arange(80) / 7.0)
+    f0[30:36] = 0.0  # an unvoiced gap
+    for a0 in (0, 10, 20, 30, 40):  # 30-frame windows advancing by 10 frames
+        want = ref(f0[a0 : a0 + 30], abs_frame0=a0)[0, 0]
+        got = dev.step(f0[a0 : a0 + 30], torch.tensor(a0), advance_frames=10)[0, 0]
+        assert torch.allclose(got, want, atol=1e-5), a0
+    ref.reset()
+    want = ref(f0[5:35], abs_frame0=5)[0, 0]  # not where the last block left off
+    got = dev.step(f0[5:35], torch.tensor(5), advance_frames=10)[0, 0]
+    assert torch.allclose(got, want, atol=1e-5)

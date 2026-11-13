@@ -27,7 +27,7 @@ from ..rvc.contentvec import ContentVec
 from ..rvc.index import GpuIndex
 from ..rvc.rmvpe import RMVPE
 from ..rvc.resample import OUT_SR
-from ..rvc.synth import FLOW_CONTEXT, Synth
+from ..rvc.synth import Synth
 from .base import LiveParams, StageTimes, StreamConfig, StreamLayout
 
 SR_IN = 16000
@@ -94,15 +94,24 @@ def build_phone(
     feats50: torch.Tensor, voice: Voice, voiced: torch.Tensor, p: LiveParams, n_frames: int
 ) -> torch.Tensor:
     """Index blend (with unvoiced gating) + consonant protection at 100 fps. → [1, T, 768]"""
+    index = voice.index if p.index_rate > 0 else None
+    protect = p.protect if p.protect < 0.5 else None
+    return mix_phone(feats50, index, voiced, p.index_rate, p.index_unvoiced, protect, n_frames)
+
+
+def mix_phone(feats50, index: GpuIndex | None, voiced, rate, unvoiced, protect, n_frames: int) -> torch.Tensor:
+    """`build_phone` with the rates as floats or 0-d tensors (so a CUDA graph can take them as
+    inputs). `index=None` / `protect=None` turn the blend / the protection off; so does a rate
+    of 0 / a protect of 1, with an identical result."""
     raw = feats50.repeat_interleave(2, dim=1)[:, :n_frames]
     mixed = raw
-    if voice.index is not None and p.index_rate > 0:
-        retr = voice.index.retrieve(feats50[0]).unsqueeze(0).repeat_interleave(2, dim=1)[:, :n_frames]
-        gate = torch.where(voiced, 1.0, p.index_unvoiced).to(raw.dtype).view(1, -1, 1)
-        rate = p.index_rate * gate
-        mixed = retr * rate + raw * (1 - rate)
-    if p.protect < 0.5:
-        w = torch.where(voiced, 1.0, p.protect).to(raw.dtype).view(1, -1, 1)
+    if index is not None:
+        retr = index.retrieve(feats50[0]).unsqueeze(0).repeat_interleave(2, dim=1)[:, :n_frames]
+        gate = torch.where(voiced, 1.0, unvoiced).to(raw.dtype).view(1, -1, 1)
+        r = rate * gate
+        mixed = retr * r + raw * (1 - r)
+    if protect is not None:
+        w = torch.where(voiced, 1.0, protect).to(raw.dtype).view(1, -1, 1)
         mixed = mixed * w + raw * (1 - w)
     return mixed
 
@@ -178,23 +187,60 @@ class RVCv2Backend:
         return self.layout
 
     # -- CUDA graphs -----------------------------------------------------------------------
+    # A block is three graph launches: ContentVec and RMVPE (+ decode) side by side, then one
+    # per-voice graph for everything after the F0 post-processing (index blend, coarse pitch,
+    # noise windows, NSF source, enc_p -> flow -> decoder). A game holding the GPU makes every
+    # separate launch wait for a time slice, so the eager glue between graphs (~130 small
+    # kernels) used to cost as much as a whole graph. Live parameters enter as tensors.
     def _build_graphs(self) -> None:
         if not self.use_graphs:
             return
-        key = (self.T_all, self.cfg.f0_method)
-        if key == getattr(self, "_graph_key", None):
-            self.prepare_voice(self.voice)  # voice switch: feature graphs stay valid
-            return
-        self._graph_key = key
-        self._g_content = self._g_rmvpe = None
-        self._g_synth.clear()
-        n = self.T_all * HOP_IN
-        x = torch.zeros(n, device=self.device)
-        fs = self.features
-        self._g_content = graphs.Graph(fs.contentvec.extract, [x])
-        if self.cfg.f0_method == "rmvpe":
-            self._g_rmvpe = graphs.Graph(fs.rmvpe.salience, [x])
+        synth_key = (self.T_all, self.dec_first, self.B, self.region_start, self.out_len, self.ext)
+        if synth_key != getattr(self, "_synth_key", None):
+            self._synth_key = synth_key
+            self._g_synth.clear()
+        feat_key = (self.W, self.ext, self.cfg.f0_method)
+        if feat_key != getattr(self, "_feat_key", None):
+            self._feat_key = feat_key
+            self._g_content = self._g_rmvpe = None
+            buf = torch.zeros(self.W, device=self.device)
+            fs, T = self.features, self.T
+            self._g_content = graphs.Graph(lambda b: fs.contentvec.extract(self._mirror(b)), [buf])
+            if self.cfg.f0_method == "rmvpe":
+                thr = torch.tensor(0.03, device=self.device)
+                rmvpe = lambda b, t: fs.rmvpe.decode(fs.rmvpe.salience(self._mirror(b)), t)[:T]  # noqa: E731
+                self._g_rmvpe = graphs.Graph(rmvpe, [buf, thr])
         self.prepare_voice(self.voice)
+
+    def _mirror(self, buf: torch.Tensor) -> torch.Tensor:
+        """Mirrored continuation so the window's right edge isn't conditioned on zeros."""
+        if not self.ext:
+            return buf
+        return torch.cat([buf, torch.flip(buf[-self.ext * HOP_IN :], [0])])
+
+    def _render_fn(self, voice: Voice):
+        """Synthesis for one voice at the current layout as a pure function of tensors, so the
+        same code runs eagerly or captured: (content [1, T_all/2, 768], post-processed f0 [T],
+        abs_frame0 (0-d long), params [pitch factor, index rate, index unvoiced, protect])
+        -> audio [out_len] at OUT_SR. Advances the voice's NSF phase by one block."""
+        synth, d0, T_all, ext = voice.synth, self.dec_first, self.T_all, self.ext
+        dec_len = T_all - d0
+        off = self.region_start - d0 * self.hop_out
+        out_len, advance = self.out_len, self.B // HOP_IN
+        g = synth.speaker(0)
+
+        def render(feats50, f0p, abs_frame0, prm):
+            if ext:
+                f0p = torch.cat([f0p, torch.flip(f0p[-ext:], [0])])
+            voiced = f0p > 0
+            f0s = f0p * prm[0]
+            phone = mix_phone(feats50, voice.index, voiced, prm[1], prm[2], prm[3], T_all)
+            pitch = to_coarse(f0s).unsqueeze(0)
+            noise, exc = synth.prepare_step(T_all, f0s, abs_frame0, d0, dec_len, advance)
+            wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
+            return wav[off : off + out_len]
+
+        return render
 
     def prepare_voice(self, voice: Voice, lock=None) -> None:
         """Capture the synth graph for `voice` at the current layout (no streaming state touched).
@@ -204,23 +250,21 @@ class RVCv2Backend:
         """
         if not self.use_graphs or self.cfg is None or id(voice.synth) in self._g_synth:
             return
-        synth, dev = voice.synth, self.device
-        dtype = self.features.contentvec.model.dtype
-        d0, T_all = self.dec_first, self.T_all
-        flow_head = max(d0 - FLOW_CONTEXT, 0)
-        dec_len = T_all - d0
-        inter = synth.z_noise.shape[0]
+        dev, key = self.device, self._synth_key
         ex = [
-            torch.zeros(1, T_all, 768, device=dev, dtype=dtype),
-            torch.ones(1, T_all, device=dev, dtype=torch.long),
-            torch.zeros(1, inter, T_all - flow_head, device=dev, dtype=synth.emb_g.weight.dtype),
-            torch.zeros(1, 1, dec_len * synth.upp, device=dev),
-            synth.speaker(0),
+            torch.zeros(1, self.T_all // 2, 768, device=dev, dtype=self.features.contentvec.model.dtype),
+            torch.zeros(self.T, device=dev),
+            torch.zeros((), device=dev, dtype=torch.long),
+            torch.tensor([1.0, 0.5, 0.5, 0.33], device=dev),
         ]
-        graph = graphs.Graph(lambda *a: synth.core(*a, d0, dec_len), ex)
+        src = voice.synth.dec.m_source
+        saved = src.phase.clone(), src.phase_at.clone()
+        graph = graphs.Graph(self._render_fn(voice), ex)
+        src.phase.copy_(saved[0])  # the capture's warm-up runs advanced the NSF phase
+        src.phase_at.copy_(saved[1])
         with lock if lock is not None else contextlib.nullcontext():
-            if (T_all, d0) == (self.T_all, self.dec_first):  # layout unchanged meanwhile
-                self._g_synth[id(synth)] = graph
+            if key == self._synth_key:  # layout unchanged meanwhile
+                self._g_synth[id(voice.synth)] = graph
 
     def reset(self) -> None:
         self.buf = torch.zeros(self.W if self.cfg else 0, device=self.device)
@@ -243,38 +287,33 @@ class RVCv2Backend:
         self.f0post.reset()
         self.voice.synth.reset()
 
-    def _features(self, xin: torch.Tensor, p: LiveParams) -> tuple[torch.Tensor, torch.Tensor]:
-        """→ (raw f0 [T_all] Hz, content [1, T_all/2, 768]). Graphs run on parallel streams."""
+    def _features(self, p: LiveParams) -> tuple[torch.Tensor, torch.Tensor]:
+        """→ (raw f0 [T] Hz, content [1, T_all/2, 768]) of the current window. Graphs run on
+        parallel streams."""
         fs, method = self.features, self.cfg.f0_method
         g_content = self._g_content if abs(p.formant) < 1e-3 else None
+        content = lambda: g_content(self.buf) if g_content is not None else fs.content(self._mirror(self.buf), p.formant)  # noqa: E731
         if self._g_rmvpe is not None and method == "rmvpe":
             cur = torch.cuda.current_stream(self.device)
             self._side.wait_stream(cur)
             with torch.cuda.stream(self._side):
-                sal = self._g_rmvpe(xin)
-            feats50 = g_content(xin) if g_content is not None else fs.content(xin, p.formant)
+                f0 = self._g_rmvpe(self.buf, torch.tensor(p.f0_threshold))
+            feats50 = content()
             cur.wait_stream(self._side)
-            f0 = fs.rmvpe.decode(sal, p.f0_threshold)[: xin.shape[0] // HOP_IN]
-        else:
-            feats50 = g_content(xin) if g_content is not None else fs.content(xin, p.formant)
-            f0 = fs.f0(xin, method, p.f0_threshold)
-        return f0, feats50
+            return f0, feats50
+        return fs.f0(self._mirror(self.buf), method, p.f0_threshold)[: self.T], content()
 
-    def _render(self, voice: Voice, p: LiveParams, feats50, f0p, voiced, abs_frame0: int):
-        """Synthesize the output region for one voice. → audio [out_len] at OUT_SR."""
-        f0s = f0p * (2.0 ** (p.pitch / 12.0))
-        phone = build_phone(feats50, voice, voiced, p, self.T_all)
-        pitch = to_coarse(f0s).to(self.device).unsqueeze(0)
-        synth, d0 = voice.synth, self.dec_first
-        dec_len = self.T_all - d0
-        noise, exc, g = synth.prepare(self.T_all, f0s, abs_frame0, d0, dec_len, commit_phase=True)
-        graph = self._g_synth.get(id(synth))
+    def _render(self, voice: Voice, p: LiveParams, feats50, f0p: torch.Tensor, abs_frame0: int):
+        """Synthesize the output region for one voice. f0p: post-processed f0 [T] on the CPU.
+        → audio [out_len] at OUT_SR (a fresh tensor)."""
+        protect = p.protect if p.protect < 0.5 else 1.0
+        prm = torch.tensor([2.0 ** (p.pitch / 12.0), p.index_rate, p.index_unvoiced, protect])
+        frame0 = torch.tensor(abs_frame0, dtype=torch.long)
+        graph = self._g_synth.get(id(voice.synth))
         if graph is not None:
-            wav = graph(phone, pitch, noise, exc, g)
-        else:
-            wav = synth.core(phone, pitch, noise, exc, g, d0, dec_len)
-        off = self.region_start - d0 * self.hop_out
-        return wav[off : off + self.out_len].clone()
+            return graph(feats50, f0p, frame0, prm).clone()  # graph outputs are reused buffers
+        dev = self.device
+        return self._render_fn(voice)(feats50, f0p.to(dev), frame0.to(dev), prm.to(dev)).clone()
 
     def _sync(self):
         if self.profile and self.device.type == "cuda":
@@ -300,31 +339,23 @@ class RVCv2Backend:
         abs_frame0 = (self.n_in - self.W) // HOP_IN
 
         self.f0post.cfg = F0PostConfig(median=p.f0_median, octave_fix=p.f0_octave_fix, glide_ms=p.f0_glide_ms)
-        T, ext = self.T, self.ext
-        xin = self.buf
-        if ext:  # mirrored continuation so the right edge isn't conditioned on zeros
-            xin = torch.cat([self.buf, torch.flip(self.buf[-ext * HOP_IN :], [0])])
-        f0_raw_all, feats50 = self._features(xin, p)
-        f0_raw = f0_raw_all[:T]
+        f0_raw, feats50 = self._features(p)
         t1 = self._sync()
 
         self._wait()  # features done: the copy below no longer has to wait on the GPU
         f0_raw_np = f0_raw.cpu().numpy()
         f0_np = self.f0post.process(abs_frame0, f0_raw_np)
-        f0p = torch.from_numpy(f0_np).float().to(self.device)
-        if ext:
-            f0p = torch.cat([f0p, torch.flip(f0p[-ext:], [0])])
+        f0p = torch.from_numpy(f0_np).float()
         t2 = self._sync()
 
-        voiced = f0p > 0
-        out = self._render(self.voice, p, feats50, f0p, voiced, abs_frame0)
+        out = self._render(self.voice, p, feats50, f0p, abs_frame0)
         if self._xfade is not None:
             old, old_p, start, n = self._xfade
             region0 = abs_frame0 * self.hop_out + self.region_start
             if region0 >= start + n:
                 self._xfade = None
             else:
-                prev = self._render(old, old_p or p, feats50, f0p, voiced, abs_frame0)
+                prev = self._render(old, old_p or p, feats50, f0p, abs_frame0)
                 idx = torch.arange(self.out_len, device=self.device) + region0
                 w = ((idx - start).float() / n).clamp(0, 1) * (math.pi / 2)
                 out = prev * torch.cos(w) + out * torch.sin(w)
