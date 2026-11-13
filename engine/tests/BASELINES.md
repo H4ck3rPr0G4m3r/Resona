@@ -41,3 +41,20 @@ blocks, 126 ms at 40 ms; 0 underruns over 60 s at 40 ms.
 
 Seam quality at 40 ms is equal or better (Trump −3, speech + singing): seam_ncc 0.921 → 0.936,
 boundary_excess 1.016 → 1.019.
+
+# GPU shared with a game (2026-11-13)
+
+A fullscreen game that keeps the GPU busy leaves the engine ~22 % of the GPU's time (HAGS on,
+"high" D3DKMT priority made no difference), so every block's GPU wall time grows ~4.5×, and so
+did each of the ~130 eager kernels between graphs. The per-voice graph now covers everything
+after F0 post (index blend, coarse pitch, noise windows, NSF source with its phase on the
+device): a block is 3 graph launches + 2 kernels instead of 3 + ~133.
+Trump/AnniePants + index, block 100 / context 500, RTX 3060 Ti.
+
+| | idle p50 | uncapped Valorant p50 / p99 | late blocks (of 200) |
+|---|---|---|---|
+| before | 16.5 ms | 69 / 155 ms | 26 |
+| after | 15.2 ms | 63 / 114 ms | 9 |
+
+Capping the game's frame rate is what removes the dropouts (synthetic fullscreen load: 67 ms
+uncapped, 30 ms at 300 fps, 22 ms at 144 fps; Valorant at 60 fps: 0 dropped blocks over 90 s).

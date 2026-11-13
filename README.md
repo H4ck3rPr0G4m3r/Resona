@@ -118,9 +118,12 @@ The latency bar under the pitch trace shows where every millisecond goes.
 - **Dropouts while gaming:**
   - The GPU work per block is set by the context window, not the block size, so a larger block
     alone rarely helps. Lowering **Context** (Settings → Pipeline) does: 500 ms is about half the work.
-  - The engine raises its GPU scheduling priority so its short bursts go ahead of the game's frames.
-    If the dropout banner says this was refused, start Resona once as administrator.
-  - Capping the game's frame rate (in the game or the NVIDIA control panel) leaves the GPU room.
+  - **Cap the game's frame rate** (in the game or the NVIDIA control panel). This is the fix that
+    matters: an uncapped fullscreen game leaves the engine only about a fifth of the GPU, so every
+    block takes ~4–5× longer. Measured with Valorant on an RTX 3060 Ti, at a 100 ms block:
+    uncapped (GPU at 90–100 %), 75 dropped blocks per minute; capped at 60 fps, none.
+  - The engine asks Windows for a higher GPU scheduling priority, but with hardware-accelerated GPU
+    scheduling on (the Windows 11 default) a fullscreen game still wins, so don't rely on it.
 - **Nothing reaches Discord:** check that Resona's Output is the cable's *playback* side and
   Discord's input is its *recording* side. Discord's own noise suppression can also eat converted
   voice; try turning it off.

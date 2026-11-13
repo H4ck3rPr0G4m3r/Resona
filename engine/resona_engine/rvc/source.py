@@ -31,11 +31,18 @@ class PhaseContinuousSource(nn.Module):
         self.sine_amp, self.noise_std = sine_amp, noise_std
         self.l_linear = nn.Linear(1, 1)  # checkpoint: dec.m_source.l_linear
         self.register_buffer("noise", fixed_noise((NOISE_LEN,), seed=0x5E50), persistent=False)
+        # Phase carried on the device by `step` (the streaming path, which runs inside a CUDA
+        # graph and so cannot read the phase back to the CPU), with the absolute sample it
+        # belongs to: a call that starts anywhere else starts from phase 0, as `forward` does.
+        self.register_buffer("phase", torch.zeros((), dtype=torch.float64), persistent=False)
+        self.register_buffer("phase_at", torch.full((), -1, dtype=torch.long), persistent=False)
         self.reset()
 
     def reset(self) -> None:
         self._prev_start: int | None = None  # absolute sample index of previous region start
         self._prev_cum: torch.Tensor | None = None  # [n+1] phase (cycles) before each sample
+        self.phase.zero_()
+        self.phase_at.fill_(-1)
 
     def _phase0(self, start: int) -> float:
         if self._prev_start is None or self._prev_cum is None:
@@ -70,5 +77,31 @@ class PhaseContinuousSource(nn.Module):
         x = sine * uv + noise_amp * self.noise_at(start, sine.shape[0])
         if commit:
             self._prev_start, self._prev_cum = start, cum
+        return self._shape(x)
+
+    @torch.no_grad()
+    def step(self, f0: torch.Tensor, abs_frame0: torch.Tensor, advance_frames: int) -> torch.Tensor:
+        """`forward` for streaming, with no CPU round trip: safe to capture in a CUDA graph.
+
+        `abs_frame0` is a long tensor. The phase continues from the previous call when this call
+        starts `advance_frames` after it (consecutive blocks), else from 0 (after a skip or on
+        another timeline); it is left at the sample `advance_frames` later.
+        """
+        f0 = f0.float()
+        start = abs_frame0 * self.upp
+        phase0 = torch.where(start == self.phase_at, self.phase, torch.zeros_like(self.phase))
+        f_up = torch.repeat_interleave(f0, self.upp)
+        inc = (f_up / self.sr).double()
+        cum = torch.remainder(phase0 + torch.cumsum(inc, 0), 1.0)
+        prev = torch.cat([phase0.view(1), cum[:-1]])  # phase before each sample
+        self.phase.copy_(prev[advance_frames * self.upp])
+        self.phase_at.copy_(start + advance_frames * self.upp)
+        sine = torch.sin(2 * math.pi * cum).float() * self.sine_amp
+        uv = (f_up > 0).float()
+        noise_amp = uv * self.noise_std + (1 - uv) * (self.sine_amp / 3)
+        idx = (torch.arange(sine.shape[0], device=self.noise.device) + start) % NOISE_LEN
+        return self._shape(sine * uv + noise_amp * self.noise[idx])
+
+    def _shape(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.tanh(self.l_linear(x.unsqueeze(-1).to(self.l_linear.weight.dtype)))
         return out.float().view(1, 1, -1)
