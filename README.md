@@ -5,10 +5,13 @@ artifacts, and an interface that stays out of the way.
 
 ![Resona running a voice with a sound file as input and an effect chain](docs/screenshot.png)
 
-**On an RTX 3060 Ti, at a 40 ms block:**
-- **Latency:** 144 ms measured mouth-to-output by the built-in self-test, through a virtual cable.
-- **GPU time:** 15 ms per block (p50), 16 ms (p99).
-- **Stability:** zero dropouts over long runs.
+**On an RTX 3060 Ti:**
+- **GPU time:** 9 ms per block (p50), 12 ms (p99), at any block size.
+- **Latency:** the built-in self-test measures about 160 ms mouth-to-output at a 60 ms block on a
+  device that queues up to two periods; a 40 ms block is 20 ms less, and a virtual cable that
+  queues one period about 10 ms less again.
+- **Stability:** zero dropouts over long runs with an idle GPU. While a game stalls the GPU, the
+  output buffer keeps the headroom it needs and gives it back ten seconds after.
 
 ## What it does
 
@@ -27,6 +30,8 @@ artifacts, and an interface that stays out of the way.
   - *Always available:* a zero-latency voice gate driven by voice detection, and a true-peak
     limiter, always last.
   - Every control is smoothed, so nothing clicks. Chains can be exported and imported as presets.
+- **Filters you write yourself:** an effect can be a small text file. **Bad Mic** ships as one.
+  See [Filters](#filters).
 - **Singing mode:** one toggle that bypasses noise suppression and the gate, which otherwise
   mangle sustained notes.
 - **Sound-file input:** play a WAV, MP3 or FLAC through the voice instead of your mic (play,
@@ -92,18 +97,52 @@ the exe on its own.
 | **Hotkeys** | Mute `Ctrl+Alt+M`, next/previous voice `Ctrl+Alt+→` / `Ctrl+Alt+←`. Push-to-talk and per-voice keys are set in Settings → Hotkeys and the voice menu. |
 
 **Lowering latency:**
-- Use the smallest block that runs without dropouts (Settings → Performance).
+- Use the smallest block that runs without dropouts (Settings → Performance). **Auto** picks it;
+  on an RTX 3060 Ti that is 40 ms, which now costs the GPU what 60 ms used to.
+- Noise suppression adds 10 ms while it is on, and nothing while it is switched off.
 - Keep the cable at 48 kHz.
 - Try **Low latency** device mode if your driver supports it. Some virtual cables run their clock
   wrong in that mode, which is why it is opt-in.
 
 The latency bar under the pitch trace shows where every millisecond goes.
 
+## Filters
+
+A filter is a `.toml` file: `[macros]` are its knobs, `[[chain]]` its stages. Add one from the **+**
+menu of a chain (**New filter** writes a commented starter file and opens it), or drop a file into
+`%APPDATA%\Resona\filters`. Saving the file updates the running filter within half a second, and
+the editor's knobs are generated from it.
+
+```toml
+name = "Telephone"
+
+[macros]
+amount = { default = 0.5 }          # 0 to 1 unless min and max say otherwise
+
+[[chain]]
+type = "highpass"
+freq = "lerp(80, 400, amount)"      # a number, or an expression over the macros
+
+[[chain]]
+type = "lowpass"
+freq = 3400
+```
+
+- **Stage types:** `highpass`, `lowpass`, `bandpass`, `peak`, `lowshelf`, `highshelf`, `gain`,
+  `saturate` (soft, hard, tube), `bitcrush`, `downsample`, `noise`, `crackle`, `delay`, and every
+  chain effect (`compressor`, `gate`, `eq`, `filter`, `deesser`, `reverb`, `chorus`, `lofi`).
+- **Expressions:** `+ - * / ( )`, `lerp(a, b, t)`, `clamp(x, lo, hi)`, `min`, `max`, `pow`, `sqrt`,
+  `exp`, `ln`, `abs`, `db`.
+- **Built-in filters** live in `filters\` next to the app. **Customize** in a filter's editor
+  copies it to your folder, where your copy replaces it.
+- A file with a mistake keeps its place in the chain, passes audio through, and the editor shows
+  what is wrong and where.
+
 ## Where things are stored
 
 | Path | Contents |
 |---|---|
-| `%APPDATA%\Resona` | Settings, voice profiles, and the voice library (`voices\<hash>\`). |
+| `%APPDATA%\Resona` | Settings, voice profiles, the voice library (`voices\<hash>\`) and your filters (`filters\`). |
 | `%LOCALAPPDATA%\Resona\assets` | ContentVec and RMVPE weights. |
 | `Music\Resona` | A/B takes (`<date> dry.wav`, `<date> wet.wav`). |
 
@@ -138,9 +177,10 @@ engine/      Python 3.12: RVC v2 inference (ContentVec, RMVPE/FCPE, synthesizer)
 host/
   shm-ipc/   shared-memory rings and events
   audio-io/  WASAPI capture/render/loopback, 48 kHz mono f32
-  dsp/       resampler, SOLA, meters, effects (fx/)
+  dsp/       resampler, SOLA, meters, effects and composite filters (fx/)
   runtime/   session state machine, real-time pipeline, file player, recorder, self-test
 app/         Tauri 2 shell (src-tauri/) and the Svelte 5 UI (src/)
+filters/     built-in composite filters (bad_mic.toml)
 docs/        design spec and implementation plan
 ```
 
@@ -165,16 +205,15 @@ and progress against it in [docs/plans/2026-10-24-resona-implementation.md](docs
 
 ## Status
 
-Milestones M1–M5 are done:
+Milestones M1–M6 are done:
 - offline engine,
 - real-time host,
 - speed,
 - full UI,
-- effects, sound-file input, A/B recorder and latency self-test.
+- effects, sound-file input, A/B recorder and latency self-test,
+- user-definable filters.
 
 Not yet built:
-- **User-definable filters** (M6): composite filters in TOML with macros, hot-reload, and a
-  "Bad Mic" preset.
 - **TensorRT engines:** optional. CUDA graphs already meet the latency targets.
 - **Installer:** for now Resona runs from the repository folder.
 
