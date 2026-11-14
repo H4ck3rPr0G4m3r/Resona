@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from . import attentions
 from .checkpoint import ModelInfo, load_state
 from .resample import OUT_SR, Resampler
-from .modules import LRELU_SLOPE, ResBlock1, ResBlock2, ResidualCouplingBlock, fold_weight_norm
+from .modules import LRELU_SLOPE, ResBlock1, ResBlock2, ResidualCouplingBlock, fold_weight_norm, to_2d
 from .source import fixed_noise, PhaseContinuousSource
 
 @contextlib.contextmanager
@@ -51,8 +51,7 @@ class TextEncoder(nn.Module):
     def forward(self, phone, pitch, skip_head: int = 0):
         x = (self.emb_phone(phone) + self.emb_pitch(pitch)) * math.sqrt(self.hidden)
         x = F.leaky_relu(x, 0.1).transpose(1, -1)  # [B, H, T]
-        x_mask = torch.ones_like(x[:, :1])
-        x = self.encoder(x, x_mask)
+        x = self.encoder(x)
         if skip_head:
             x = x[:, :, skip_head:]
         stats = self.proj(x)
@@ -88,6 +87,7 @@ class GeneratorNSFBody(nn.Module):
         self.cond = nn.Conv1d(gin_channels, uic, 1)
 
     def forward(self, x, har_source, g):
+        """x [1, C, 1, T], har_source [1, 1, 1, T·upp], g [1, gin, 1, 1] → [1, 1, 1, T·upp]."""
         x = self.conv_pre(x) + self.cond(g)
         har_source = har_source.to(x.dtype)
         for i, (up, nc) in enumerate(zip(self.ups, self.noise_convs)):
@@ -131,7 +131,12 @@ class Synth(nn.Module):
             model.load_state_dict(state, strict=True)
         except RuntimeError as e:
             raise ValueError(f"{Path(path).name}: unsupported model layout ({info.vocoder_architecture}): {e}") from e
+        # Flow and decoder run as 2-D convolutions over [1, C, 1, T], channels-last (see `to_2d`).
+        to_2d(model.flow)
+        to_2d(model.dec)
         model.eval().to(device)
+        model.flow.to(memory_format=torch.channels_last)
+        model.dec.to(memory_format=torch.channels_last)
         model.half_precision = half
         if half:
             model.half()
@@ -189,11 +194,11 @@ class Synth(nn.Module):
         flow_head = max(dec_start - FLOW_CONTEXT, 0)
         m_p, logs_p = self.enc_p(phone.to(dtype), pitch, flow_head)
         z_p = m_p + torch.exp(logs_p) * noise * 0.66666
-        x_mask = torch.ones_like(z_p[:, :1])
-        z = self.flow.reverse(z_p, x_mask, g)
+        g = g.unsqueeze(2)
+        z = self.flow.reverse(z_p.unsqueeze(2).contiguous(memory_format=torch.channels_last), g)
         off = dec_start - flow_head
-        z = z[:, :, off : off + dec_len]
-        return self.resampler(self.dec(z, exc, g)[0, 0].float())
+        z = z[..., off : off + dec_len]
+        return self.resampler(self.dec(z, exc.unsqueeze(2), g).reshape(-1).float())
 
     def reset(self) -> None:
         self.dec.m_source.reset()

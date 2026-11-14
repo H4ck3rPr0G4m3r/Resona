@@ -12,6 +12,24 @@ fn main() {
         }
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("probe") {
+        // Open every device in shared mode for a moment (silence out) and print its buffering.
+        for d in list_devices(Direction::Capture).unwrap() {
+            let cfg = StreamConfig { device_id: Some(d.id), ..Default::default() };
+            match CaptureStream::start(cfg, |_| {}, |_| {}) {
+                Ok(s) => println!("capture {:?}", s.info()),
+                Err(e) => println!("capture {}: {e}", d.name),
+            }
+        }
+        for d in list_devices(Direction::Render).unwrap() {
+            let cfg = StreamConfig { device_id: Some(d.id), ..Default::default() };
+            match RenderStream::start(cfg, |out| out.fill(0.0), |_| {}) {
+                Ok(s) => println!("render  {:?}", s.info()),
+                Err(e) => println!("render  {}: {e}", d.name),
+            }
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) != Some("passthrough") {
         return;
     }

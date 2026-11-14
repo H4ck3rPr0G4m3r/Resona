@@ -1,4 +1,6 @@
-"""VITS relative-position transformer encoder (layout compatible with RVC checkpoints)."""
+"""VITS relative-position transformer encoder (layout compatible with RVC checkpoints).
+
+Without the padding mask of the original: a streaming window is never padded."""
 
 from __future__ import annotations
 
@@ -37,7 +39,7 @@ class MultiHeadAttention(nn.Module):
         self.emb_rel_k = nn.Parameter(torch.randn(1, window_size * 2 + 1, self.k_channels) * rel)
         self.emb_rel_v = nn.Parameter(torch.randn(1, window_size * 2 + 1, self.k_channels) * rel)
 
-    def forward(self, x, attn_mask):
+    def forward(self, x):
         q, k, v = self.conv_q(x), self.conv_k(x), self.conv_v(x)
         b, d, t = k.shape
         h, kc = self.n_heads, self.k_channels
@@ -48,7 +50,6 @@ class MultiHeadAttention(nn.Module):
         rel_k = self._relative_embeddings(self.emb_rel_k, t)
         rel_logits = torch.matmul(q, rel_k.unsqueeze(0).transpose(-2, -1))
         scores = scores + self._rel_to_abs(rel_logits)
-        scores = scores.masked_fill(attn_mask == 0, -1e4)
         p = F.softmax(scores, dim=-1)
         out = torch.matmul(p, v)
         rel_v = self._relative_embeddings(self.emb_rel_v, t)
@@ -88,10 +89,9 @@ class FFN(nn.Module):
         self.conv_2 = nn.Conv1d(filter_ch, out_ch, kernel_size)
         self.pad = ((kernel_size - 1) // 2, kernel_size // 2)
 
-    def forward(self, x, x_mask):
-        x = torch.relu(self.conv_1(F.pad(x * x_mask, self.pad)))
-        x = self.conv_2(F.pad(x * x_mask, self.pad))
-        return x * x_mask
+    def forward(self, x):
+        x = torch.relu(self.conv_1(F.pad(x, self.pad)))
+        return self.conv_2(F.pad(x, self.pad))
 
 
 class Encoder(nn.Module):
@@ -107,10 +107,8 @@ class Encoder(nn.Module):
             self.ffn_layers.append(FFN(hidden, hidden, filter_ch, kernel_size))
             self.norm_layers_2.append(LayerNorm(hidden))
 
-    def forward(self, x, x_mask):
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
-        x = x * x_mask
+    def forward(self, x):
         for attn, n1, ffn, n2 in zip(self.attn_layers, self.norm_layers_1, self.ffn_layers, self.norm_layers_2):
-            x = n1(x + attn(x, attn_mask))
-            x = n2(x + ffn(x, x_mask))
-        return x * x_mask
+            x = n1(x + attn(x))
+            x = n2(x + ffn(x))
+        return x
