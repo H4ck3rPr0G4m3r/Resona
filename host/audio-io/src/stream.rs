@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -305,8 +305,23 @@ impl Drop for CaptureStream {
     }
 }
 
+/// How many frames to hand a shared-mode render device on a wake-up.
+///
+/// Windows allocates about 22 ms of buffer for a 10 ms period. Topping it up to the brim on
+/// every event, as this stream used to, keeps 12 to 22 ms queued in front of every sample. The
+/// device only ever needs its next period, so write one period at a time and never let more
+/// than two wait:
+///
+/// * Woken after the device took its period (the usual order): the queue is empty, one period
+///   goes in, and that is all that ever waits (10 ms).
+/// * Woken before the take: one period is still there, so two wait for a moment; no take can
+///   come up short in either order.
+pub fn shared_refill(period: usize, queued: usize, space: usize) -> usize {
+    period.min((2 * period).saturating_sub(queued)).min(space)
+}
+
 /// Event-driven render. `fill` must write 48 kHz mono f32 into the slice on the audio thread.
-pub struct RenderStream(Running);
+pub struct RenderStream(Running, Arc<AtomicU32>);
 
 impl RenderStream {
     pub fn start<F, E>(cfg: StreamConfig, mut fill: F, on_error: E) -> Result<Self>
@@ -314,6 +329,8 @@ impl RenderStream {
         F: FnMut(&mut [f32]) + Send + 'static,
         E: FnOnce(String) + Send + 'static,
     {
+        let queued = Arc::new(AtomicU32::new(0));
+        let queued_w = queued.clone();
         let r = Running::spawn("resona-render", Direction::Render, cfg, move |o, stop| {
             let res = (|| -> std::result::Result<(), String> {
                 let render = o.client.get_audiorenderclient().map_err(|e| e.to_string())?;
@@ -321,10 +338,14 @@ impl RenderStream {
                 let frame_bytes = o.fmt.bytes() * o.channels;
                 let mut bytes = vec![0u8; frames_max * frame_bytes];
                 let mut mono = vec![0f32; frames_max];
+                // Exclusive mode hands over its whole buffer per event; shared mode is paced.
+                let shared = o.info.mode != "exclusive";
+                let period = (o.info.period_frames as usize).clamp(1, frames_max);
                 // Prime with silence so the stream starts without an underrun.
-                let avail = o.client.get_available_space_in_frames().map_err(|e| e.to_string())? as usize;
+                let avail = (o.client.get_available_space_in_frames().map_err(|e| e.to_string())? as usize).min(frames_max);
+                let prime = if shared { period.min(avail) } else { avail };
                 render
-                    .write_to_device(avail, &bytes[..avail * frame_bytes], None)
+                    .write_to_device(prime, &bytes[..prime * frame_bytes], None)
                     .map_err(|e| e.to_string())?;
                 o.client.start_stream().map_err(|e| e.to_string())?;
                 let mut idle = 0;
@@ -337,13 +358,16 @@ impl RenderStream {
                         continue;
                     }
                     idle = 0;
-                    let n = (o.client.get_available_space_in_frames().map_err(|e| e.to_string())? as usize).min(frames_max);
+                    let space = (o.client.get_available_space_in_frames().map_err(|e| e.to_string())? as usize).min(frames_max);
+                    let in_queue = frames_max - space;
+                    let n = if shared { shared_refill(period, in_queue, space) } else { space };
                     if n == 0 {
                         continue;
                     }
                     fill(&mut mono[..n]);
                     from_mono(&mono[..n], o.fmt, o.channels, &mut bytes[..n * frame_bytes]);
                     render.write_to_device(n, &bytes[..n * frame_bytes], None).map_err(|e| e.to_string())?;
+                    queued_w.store((in_queue + n) as u32, Ordering::Relaxed);
                 }
                 let _ = o.client.stop_stream();
                 Ok(())
@@ -352,15 +376,70 @@ impl RenderStream {
                 on_error(e);
             }
         })?;
-        Ok(Self(r))
+        Ok(Self(r, queued))
     }
 
     pub fn info(&self) -> &StreamInfo {
         &self.0.info
     }
 
+    /// Frames waiting in the device buffer right after the latest write: the delay the device
+    /// buffer adds in front of a sample handed over now (0 until the stream has run).
+    pub fn queued_frames(&self) -> u32 {
+        self.1.load(Ordering::Relaxed)
+    }
+
     pub fn stop(mut self) {
         self.0.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_refill;
+
+    const PERIOD: usize = 480;
+    const BUFFER: usize = 1056;
+
+    /// Device model: every period it takes one period from the queue (a short take is a glitch)
+    /// and wakes the client, before the take on the passes `wake_first` says so, else after.
+    /// Returns (glitches, smallest, largest queue right after a write) past the first passes.
+    fn simulate(primed: usize, wake_first: impl Fn(usize) -> bool) -> (usize, usize, usize) {
+        let mut queue = primed;
+        let (mut glitches, mut lo, mut hi) = (0, usize::MAX, 0);
+        for pass in 0..300 {
+            let early = wake_first(pass);
+            if early {
+                queue += shared_refill(PERIOD, queue, BUFFER - queue);
+                (lo, hi) = if pass >= 250 { (lo.min(queue), hi.max(queue)) } else { (lo, hi) };
+            }
+            if queue < PERIOD {
+                glitches += 1;
+            }
+            queue = queue.saturating_sub(PERIOD);
+            if !early {
+                queue += shared_refill(PERIOD, queue, BUFFER - queue);
+                (lo, hi) = if pass >= 250 { (lo.min(queue), hi.max(queue)) } else { (lo, hi) };
+            }
+        }
+        (glitches, lo, hi)
+    }
+
+    #[test]
+    fn shared_refill_queues_one_period_and_never_runs_dry() {
+        // Woken after each take: exactly one period waits (10 ms; the full buffer was 22 ms).
+        assert_eq!(simulate(PERIOD, |_| false), (0, PERIOD, PERIOD));
+        // Woken before each take: two periods at the peak, and nothing ever runs dry.
+        assert_eq!(simulate(PERIOD, |_| true), (0, 2 * PERIOD, 2 * PERIOD));
+        // Mixed orders, and odd amounts in the queue at the start: still no short take.
+        for primed in [PERIOD, 500, 700, 960, BUFFER] {
+            let (glitches, lo, hi) = simulate(primed, |p| p % 7 == 3);
+            assert_eq!(glitches, 0, "primed {primed}");
+            assert!(lo >= PERIOD && hi <= 2 * PERIOD, "primed {primed}: {lo}..{hi}");
+        }
+        // A full buffer (what the old code kept) is left to drain.
+        assert_eq!(shared_refill(PERIOD, BUFFER, 0), 0);
+        assert_eq!(shared_refill(PERIOD, 0, 100), 100, "never more than the device has room for");
     }
 }
 

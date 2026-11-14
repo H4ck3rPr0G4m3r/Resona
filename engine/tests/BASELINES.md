@@ -58,3 +58,40 @@ Trump/AnniePants + index, block 100 / context 500, RTX 3060 Ti.
 
 Capping the game's frame rate is what removes the dropouts (synthetic fullscreen load: 67 ms
 uncapped, 30 ms at 300 fps, 22 ms at 144 fps; Valorant at 60 fps: 0 dropped blocks over 90 s).
+
+# Latency pass (2026-11-14)
+
+**Engine.** Per block, block 60 / context 500, Trump 40k + index, RTX 3060 Ti, CUDA graphs:
+
+| | ContentVec | RMVPE | synth | total p50 / p99 (ms) |
+|---|---|---|---|---|
+| before | 3.1 | 5.8 | 5.4 | 13.4 / 15.1 |
+| after | 2.6 | 3.2 | 3.8 | 9.3 / 12.2 |
+
+What changed: RMVPE's U-Net runs channels-last with BatchNorm folded in; flow and decoder are 2-D
+convolutions over [1, C, 1, T], channels-last; ContentVec's positional-conv weight norm is baked;
+the all-ones padding mask is gone. Harness (Trump −3, 4 clips, context 500): seam_ncc 0.914 →
+0.913, boundary_excess 1.022 → 1.021. In fp16, channels-last RMVPE is closer to fp32 (worst frame
+14.6 cents off) than the old layout was (32.9).
+
+Tried and dropped: `cudnn.benchmark` (0.6 ms less, but 20 s per stream configuration and 10 s per
+voice switch), a shorter RMVPE window (no gain: the U-Net is launch-bound, not size-bound).
+
+**Host.** Self-test (5 bursts, median), block 60 / context 1000, no input chain, GPU shared with
+a second live session, output "Speakers (Steam Streaming Speakers)" (a device that queues one to
+two periods, so runs differ by up to 10 ms), alternating old and new builds:
+
+| | runs (ms) |
+|---|---|
+| before | 170, 176, 175, 172 and 165, 172, 167, 176 |
+| after | 160, 162, 160 and 146, 149; one run at 191 during a GPU stall (p50 28 ms) with a dropout |
+
+(The 146 and 149 are from the build before the start-up grace period; its two other runs sat at
+186 and 187 after a start-up underrun, which the grace period removes.)
+
+Not in those numbers: a switched-off noise suppressor used to add 20 ms (now 0; 10 ms when on),
+and on a device that wakes the app after taking its audio ("Line 1 (Virtual Audio Cable)",
+measured with `devices -- probe`) the device queue is 10 ms where it was 12 to 22.
+
+Render-side simulation (one block in fifty arrives 40 ms late, every 3 s): 8 dropouts in the
+first 24 s → 1; extra latency 20 s after the last stall: 40 ms → 0.

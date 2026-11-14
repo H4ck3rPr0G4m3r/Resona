@@ -187,6 +187,26 @@ def mel_filterbank() -> torch.Tensor:
     return torch.from_numpy(weights.astype(np.float32))
 
 
+def fold_batchnorm(model: nn.Module) -> nn.Module:
+    """Fold each eval-mode `conv → BatchNorm2d` pair of an `nn.Sequential` into the convolution.
+
+    Same function, a third fewer kernels to launch per block. In place; returns `model`."""
+    for seq in [m for m in model.modules() if isinstance(m, nn.Sequential)]:
+        items = list(seq.named_children())
+        for (_, conv), (bn_name, bn) in zip(items, items[1:]):
+            if not (isinstance(bn, nn.BatchNorm2d) and isinstance(conv, (nn.Conv2d, nn.ConvTranspose2d))):
+                continue
+            scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+            shift = bn.bias - bn.running_mean * scale
+            # Conv2d weights are [out, in, kh, kw], ConvTranspose2d weights are [in, out, kh, kw].
+            shape = (1, -1, 1, 1) if isinstance(conv, nn.ConvTranspose2d) else (-1, 1, 1, 1)
+            bias = shift if conv.bias is None else conv.bias * scale + shift
+            conv.weight = nn.Parameter(conv.weight * scale.view(shape), requires_grad=False)
+            conv.bias = nn.Parameter(bias, requires_grad=False)
+            setattr(seq, bn_name, nn.Identity())
+    return model
+
+
 class RMVPE(nn.Module):
     """Pitch estimator. `infer(x16k)` returns Hz per 10 ms frame (len(x)//160 frames)."""
 
@@ -196,6 +216,11 @@ class RMVPE(nn.Module):
         state = torch.load(path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
+        with torch.no_grad():
+            fold_batchnorm(self.model.unet)  # in fp32, before any cast
+        # The U-Net is ~110 small 2-D convolutions. In fp16 cuDNN runs them about twice as fast
+        # channels-last (5.8 → 3.2 ms per block on an RTX 3060 Ti), and closer to the fp32 result.
+        self.model.to(memory_format=torch.channels_last)
         self.register_buffer("mel_basis", mel_filterbank(), persistent=False)
         self.register_buffer("window", torch.hann_window(N_FFT), persistent=False)
         cents = 20 * torch.arange(N_CLASSES, dtype=torch.float32) + CENTS_OFFSET

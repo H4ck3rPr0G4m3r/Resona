@@ -22,8 +22,10 @@ pub struct EngineLocation {
 }
 
 /// Find `engine/` (with its uv venv): $RESONA_ENGINE_DIR, then walking up from the executable
-/// and the current directory.
+/// and the current directory. $RESONA_ENGINE_PYTHON names the interpreter to use instead of the
+/// directory's own `.venv` (a git worktree has the sources but not the 4 GB environment).
 pub fn locate_engine() -> Option<EngineLocation> {
+    let python_override = std::env::var("RESONA_ENGINE_PYTHON").ok().map(PathBuf::from);
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(d) = std::env::var("RESONA_ENGINE_DIR") {
         candidates.push(PathBuf::from(d));
@@ -37,7 +39,7 @@ pub fn locate_engine() -> Option<EngineLocation> {
     }
     candidates.extend(roots.into_iter().map(|r| r.join("engine")));
     candidates.into_iter().find_map(|dir| {
-        let python = dir.join(".venv").join("Scripts").join("python.exe");
+        let python = python_override.clone().unwrap_or_else(|| dir.join(".venv").join("Scripts").join("python.exe"));
         (dir.join("pyproject.toml").is_file() && python.is_file()).then_some(EngineLocation { dir, python })
     })
 }

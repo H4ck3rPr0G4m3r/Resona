@@ -63,6 +63,12 @@ fn main() {
         "jitter_ms": 10
     }))
     .unwrap();
+    // --fx settings.json: effect settings (the app's settings file, or just its "fx" object).
+    if let Some(path) = flag("--fx") {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("--fx file")).expect("--fx json");
+        let fx = v.get("fx").cloned().unwrap_or(v);
+        rt.set_fx(serde_json::from_value(fx).expect("--fx settings")).expect("apply --fx");
+    }
     let t0 = Instant::now();
     rt.start(cfg).expect("start");
     println!("started in {:.1}s", t0.elapsed().as_secs_f32());

@@ -178,4 +178,25 @@ audio rings plus JSON-RPC.
 ## M6 — Filters
 - 6.1 Expression language + TOML composite filters + primitives registry.
 - 6.2 Hot-reload, generated UI, Bad Mic.
-- Status: deferred (not started).
+- Status (done): all of the above.
+  - Files: `host/dsp/src/fx/{expr,prims,composite}.rs`, `host/runtime/src/filters.rs`,
+    `filters/bad_mic.toml`, add menu and editor in `app/src/components/`.
+  - A filter is a chain slot of kind `filter:<file>` whose parameters are its macros, so chains,
+    presets, per-voice chains and the generated editor needed no second code path.
+  - Deviation: expressions are evaluated when a macro moves, as the spec says, but on the audio
+    thread (compiled to postfix, no allocation) instead of the control thread, because that is
+    where every other parameter change is applied.
+  - Deviation: the filter folders are polled twice a second rather than watched.
+  - More functions than the spec lists (`min`, `max`, `pow`, `sqrt`, `ln`, `abs`, `db`).
+
+## Latency pass (2026-11-14)
+
+Not a milestone of the original plan. Mouth-to-ear was 173 ms on the latency bar (more in
+reality) and climbed while a game shared the GPU.
+- Engine: 13.4 → 9.3 ms GPU per block (channels-last convolutions, BatchNorm folding).
+- Noise suppression: 20 ms even when off → 0 ms off, 10 ms on.
+- Output device buffer: 12–22 ms queued → one period (10 ms on the virtual cable).
+- Output FIFO: remembers a late block for ten seconds (one dropout per stall episode, not one
+  per stall) and returns the headroom within 20 s.
+- The latency bar now shows the measured device queue and FIFO wait.
+- Numbers and method: `engine/tests/BASELINES.md`.

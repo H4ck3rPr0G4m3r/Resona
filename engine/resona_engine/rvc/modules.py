@@ -1,4 +1,9 @@
-"""Flow (WaveNet coupling) and HiFi-GAN building blocks, weight norm folded at load time."""
+"""Flow (WaveNet coupling) and HiFi-GAN building blocks, weight norm folded at load time.
+
+The blocks are written for [B, C, T] tensors but only use shape-agnostic operations, so after
+`to_2d` they run unchanged on [B, C, 1, T] (see `Synth`). Streaming never pads a batch, so the
+all-ones `x_mask` of the original code is gone: multiplying by it only cost kernel launches.
+"""
 
 from __future__ import annotations
 
@@ -28,8 +33,8 @@ class WN(nn.Module):
             res_skip = 2 * hidden if i < n_layers - 1 else hidden
             self.res_skip_layers.append(nn.Conv1d(hidden, res_skip, 1))
 
-    def forward(self, x, x_mask, g):
-        out = torch.zeros_like(x)
+    def forward(self, x, g):
+        out = None
         g = self.cond_layer(g)
         h = self.hidden
         for i in range(self.n_layers):
@@ -37,11 +42,12 @@ class WN(nn.Module):
             acts = torch.tanh(a[:, :h]) * torch.sigmoid(a[:, h:])
             rs = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
-                x = (x + rs[:, :h]) * x_mask
-                out = out + rs[:, h:]
+                x = x + rs[:, :h]
+                skip = rs[:, h:]
             else:
-                out = out + rs
-        return out * x_mask
+                skip = rs
+            out = skip if out is None else out + skip
+        return out
 
 
 class ResidualCouplingLayer(nn.Module):
@@ -52,15 +58,14 @@ class ResidualCouplingLayer(nn.Module):
         self.enc = WN(hidden, kernel_size, dilation_rate, n_layers, gin_channels)
         self.post = nn.Conv1d(hidden, self.half, 1)  # mean-only
 
-    def reverse(self, x, x_mask, g):
+    def reverse(self, x, g):
         x0, x1 = x[:, : self.half], x[:, self.half :]
-        h = self.enc(self.pre(x0) * x_mask, x_mask, g)
-        m = self.post(h) * x_mask
-        return torch.cat([x0, (x1 - m) * x_mask], 1)
+        m = self.post(self.enc(self.pre(x0), g))
+        return torch.cat([x0, x1 - m], 1)
 
 
 class Flip(nn.Module):
-    def reverse(self, x, x_mask, g):
+    def reverse(self, x, g):
         return torch.flip(x, [1])
 
 
@@ -72,9 +77,9 @@ class ResidualCouplingBlock(nn.Module):
             self.flows.append(ResidualCouplingLayer(channels, hidden, kernel_size, dilation_rate, n_layers, gin_channels))
             self.flows.append(Flip())
 
-    def reverse(self, x, x_mask, g):
+    def reverse(self, x, g):
         for flow in reversed(self.flows):
-            x = flow.reverse(x, x_mask, g)
+            x = flow.reverse(x, g)
         return x
 
 
@@ -109,6 +114,28 @@ class ResBlock2(nn.Module):
         for c in self.convs:
             x = c(F.leaky_relu(x, LRELU_SLOPE)) + x
         return x
+
+
+def to_2d(module: nn.Module) -> nn.Module:
+    """Replace every Conv1d / ConvTranspose1d below `module` by the equivalent 2-D layer over
+    [B, C, 1, T], in place. cuDNN runs 1-D convolutions as 2-D ones anyway; as real 2-D layers
+    they can use the channels-last layout, which is what makes fp16 fast (decoder 2.7 → 1.7 ms).
+    """
+    for name, c in list(module.named_children()):
+        if isinstance(c, nn.Conv1d):
+            new = nn.Conv2d(c.in_channels, c.out_channels, (1, c.kernel_size[0]), (1, c.stride[0]),
+                            (0, c.padding[0]), (1, c.dilation[0]), c.groups, c.bias is not None)
+        elif isinstance(c, nn.ConvTranspose1d):
+            new = nn.ConvTranspose2d(c.in_channels, c.out_channels, (1, c.kernel_size[0]), (1, c.stride[0]),
+                                     (0, c.padding[0]), (0, c.output_padding[0]), c.groups, c.bias is not None)
+        else:
+            to_2d(c)
+            continue
+        new.weight = nn.Parameter(c.weight.detach().unsqueeze(2), requires_grad=False)
+        if c.bias is not None:
+            new.bias = nn.Parameter(c.bias.detach(), requires_grad=False)
+        setattr(module, name, new.to(c.weight.device))
+    return module
 
 
 def fold_weight_norm(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

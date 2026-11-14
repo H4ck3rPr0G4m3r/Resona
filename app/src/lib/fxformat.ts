@@ -1,4 +1,15 @@
-import type { ParamSpec } from "./api";
+import { FILTER_PREFIX, type ParamSpec } from "./api";
+
+export const isFilter = (kind: string) => kind.startsWith(FILTER_PREFIX);
+
+/** A readable name for a filter whose file (and so its catalog entry) is gone. */
+export function filterNameFromKind(kind: string): string {
+  const words = kind.slice(FILTER_PREFIX.length).split(/[_-]+/).filter(Boolean);
+  return words.map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") || "Filter";
+}
+
+/** File name of a path, for display. */
+export const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
 /** Human formatting of an effect parameter value. */
 export function formatParam(p: ParamSpec, v: number): string {

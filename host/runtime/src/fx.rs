@@ -173,6 +173,17 @@ impl FxHub {
         *self.controls.lock() = None;
     }
 
+    /// Build the running chains again from their specs: a filter file they use was edited.
+    pub fn rebuild(&self) {
+        if let Some((i, o)) = self.controls.lock().as_ref() {
+            for chain in [i, o] {
+                if let Err(e) = chain.rebuild() {
+                    log::warn!("chain not rebuilt: {e}");
+                }
+            }
+        }
+    }
+
     pub fn push_vad(&self, prob: f32) {
         let f = self.vad_frames.load(Ordering::Relaxed);
         self.vad[(f as usize) % VAD_RING].store((prob.clamp(0.0, 1.0) * 255.0) as u8, Ordering::Relaxed);

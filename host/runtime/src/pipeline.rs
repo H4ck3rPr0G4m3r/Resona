@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 pub const RATE: usize = 48_000;
 const FADE: usize = 240; // 5 ms at 48 kHz
 const CAPTURE_MAX_CHUNK: usize = 4096;
+/// Frame the capture side works in (10 ms).
+const FRAME: usize = resona_dsp::fx::MAX_CHUNK;
 const CAPTURE_TAPS: usize = 64;
 
 /// Engine stream layout (mirrors the Python `StreamLayout`).
@@ -72,6 +74,9 @@ pub struct Shared {
     pub captured: AtomicU64,
     pub rendered: AtomicU64,
     pub fifo_samples: AtomicUsize,
+    /// What a new block finds in the output FIFO in front of it (48 kHz samples, smoothed): the
+    /// time it waits there. 0 = not measured yet.
+    pub fifo_wait: AtomicUsize,
     /// Current (adaptive) render jitter target in 48 kHz samples.
     pub jitter_samples: AtomicUsize,
     pub engine_live: AtomicBool,
@@ -100,6 +105,7 @@ impl Default for Shared {
             captured: AtomicU64::new(0),
             rendered: AtomicU64::new(0),
             fifo_samples: AtomicUsize::new(0),
+            fifo_wait: AtomicUsize::new(0),
             jitter_samples: AtomicUsize::new(0),
             engine_live: AtomicBool::new(false),
             down_mode: AtomicU8::new(0),
@@ -201,7 +207,13 @@ pub struct CaptureSide {
     shared: Arc<Shared>,
     fx: LiveChain,
     vad: VadTracker,
+    /// The 10 ms frame being collected. Everything from here on runs on whole frames, whatever
+    /// packet size the device delivers: effect chains need that (see `resona_dsp::fx`), and an
+    /// engine block is a whole number of frames, so no sample waits longer for it.
     work: Vec<f32>,
+    work_fill: usize,
+    /// Capture time of `work[0]` (100 ns QPC units, 0 = unknown).
+    work_qpc: u64,
     player: PlayerSide,
     rec: DrySide,
     injector: Injector,
@@ -217,23 +229,35 @@ impl CaptureSide {
     /// `qpc`: capture time of `x[0]` in 100 ns QPC units (0 = unknown).
     pub fn process_timed(&mut self, x: &[f32], qpc: u64) {
         const HNS: f64 = 1e7 / RATE as f64;
-        for (k, raw) in x.chunks(CAPTURE_MAX_CHUNK).enumerate() {
-            let n = raw.len();
-            let sh = &*self.shared;
-            let w = &mut self.work[..n];
-            w.copy_from_slice(raw);
-            self.player.process(&sh.player, w);
-            let q = if qpc == 0 { 0 } else { qpc + ((k * CAPTURE_MAX_CHUNK) as f64 * HNS) as u64 };
-            self.injector.process(&sh.selftest, w, q);
-            self.vad.feed(w, |p| sh.fx.push_vad(p));
-            self.rec.push(&sh.recorder, self.raw_t, w);
-            self.raw_t += n as u64;
-            self.fx.process(&mut self.work[..n]);
-            self.shared.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
-            let mut buf = std::mem::take(&mut self.work);
-            self.process_chunk(&buf[..n]);
-            std::mem::swap(&mut self.work, &mut buf);
+        let mut i = 0;
+        while i < x.len() {
+            if self.work_fill == 0 {
+                self.work_qpc = if qpc == 0 { 0 } else { qpc + (i as f64 * HNS) as u64 };
+            }
+            let take = (FRAME - self.work_fill).min(x.len() - i);
+            self.work[self.work_fill..self.work_fill + take].copy_from_slice(&x[i..i + take]);
+            self.work_fill += take;
+            i += take;
+            if self.work_fill == FRAME {
+                self.work_fill = 0;
+                self.process_frame();
+            }
         }
+    }
+
+    fn process_frame(&mut self) {
+        let sh = &*self.shared;
+        let w = &mut self.work[..];
+        self.player.process(&sh.player, w);
+        self.injector.process(&sh.selftest, w, self.work_qpc);
+        self.vad.feed(w, |p| sh.fx.push_vad(p));
+        self.rec.push(&sh.recorder, self.raw_t, w);
+        self.raw_t += FRAME as u64;
+        self.fx.process(w);
+        sh.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
+        let mut buf = std::mem::take(&mut self.work);
+        self.process_chunk(&buf);
+        std::mem::swap(&mut self.work, &mut buf);
     }
 
     fn process_chunk(&mut self, x: &[f32]) {
@@ -266,13 +290,21 @@ impl CaptureSide {
 /// Device-thread side of rendering: underrun concealment plus a latency controller.
 ///
 /// Blocks arrive in bursts of one engine block, so the FIFO level saw-tooths between a floor
-/// and floor + block. The controller watches the floor (minimum level over a 1 s window); if it
-/// sits above the jitter target — after a start-up burst or from slow clock drift — the excess
-/// is skipped with a short crossfade, so latency never creeps up.
+/// and floor + block. The floor is what the latest block left; the controller keeps it at the
+/// jitter target:
 ///
-/// The target itself adapts: an underrun raises it by `ADAPT_UP` (up to `adapt_max` above the
-/// configured minimum), and after `RELAX_AFTER` without one it eases back, so a GPU that spikes now
-/// and then trades some latency for no dropouts instead of glitching repeatedly.
+/// * It remembers the floor of each of the last `FLOOR_MEMORY` seconds and skips (with a short
+///   crossfade) only what stayed above the target in all of them. So the latency follows the
+///   latest block of the last ten seconds, not of the last one: a GPU that a game stalls every
+///   few seconds costs its headroom once instead of a dropout at every stall, and the headroom
+///   is given back ten seconds after the stalls end.
+/// * After an underrun it waits for the target on top of the block that came too late, so an
+///   equally late block finds the target still buffered.
+/// * The target itself adapts as a backstop: an underrun within `RELAX_AFTER` of the previous
+///   one (that headroom was not enough) raises it by `ADAPT_UP`, up to `adapt_max` above the
+///   configured minimum; after `RELAX_AFTER` without one it eases back.
+/// * The first `GRACE` of a stream teaches it nothing: the engine's first blocks are slow in a
+///   way later ones are not, so an underrun there is only refilled.
 pub struct RenderSide {
     fifo: rtrb::Consumer<f32>,
     starved: bool,
@@ -284,6 +316,14 @@ pub struct RenderSide {
     clean: usize,
     window_min: usize,
     window_pos: usize,
+    /// Floors of the last seconds, oldest first, as they would be at the current skip position.
+    floors: [usize; FLOOR_MEMORY],
+    floors_len: usize,
+    /// Samples of silence still to play before resuming after an underrun.
+    hold: usize,
+    /// Samples played so far, and since the latest underrun that counted.
+    played: usize,
+    since_underrun: usize,
     scratch: Vec<f32>,
     pending: [f32; FADE],
     pending_len: usize,
@@ -294,6 +334,7 @@ pub struct RenderSide {
 }
 
 const CONTROL_WINDOW: usize = RATE; // 1 s
+const FLOOR_MEMORY: usize = 10; // control windows
 const CONTROL_SLACK: usize = 3 * RATE / 1000; // tolerate 3 ms above target
 const ADAPT_UP: usize = 5 * RATE / 1000;
 /// Least headroom the target may grow by. With larger blocks it may grow by one block: a GPU
@@ -301,8 +342,9 @@ const ADAPT_UP: usize = 5 * RATE / 1000;
 /// dropping out over and over instead of settling.
 const ADAPT_MAX: usize = 40 * RATE / 1000;
 const ADAPT_DOWN: usize = RATE / 1000;
-const RELAX_AFTER: usize = 20 * RATE; // underrun-free time before easing the target down
-const RELAX_EVERY: usize = 3 * RATE;
+const RELAX_AFTER: usize = 10 * RATE; // underrun-free time before easing the target down
+const RELAX_EVERY: usize = RATE;
+const GRACE: usize = 3 * RATE;
 
 impl RenderSide {
     fn new(fifo: rtrb::Consumer<f32>, prefill: usize, adapt_max: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
@@ -317,6 +359,11 @@ impl RenderSide {
             clean: 0,
             window_min: usize::MAX,
             window_pos: 0,
+            floors: [0; FLOOR_MEMORY],
+            floors_len: 0,
+            hold: 0,
+            played: 0,
+            since_underrun: RELAX_AFTER,
             scratch: vec![0.0; RATE + FADE],
             pending: [0.0; FADE],
             pending_len: 0,
@@ -339,11 +386,18 @@ impl RenderSide {
                 self.decay_last(out);
                 return;
             }
+            if self.hold > 0 {
+                self.hold = self.hold.saturating_sub(out.len());
+                self.decay_last(out);
+                return;
+            }
             self.starved = false;
             self.fade_in = 0;
             self.window_min = usize::MAX;
             self.window_pos = 0;
         }
+        self.played += out.len();
+        self.since_underrun = self.since_underrun.saturating_add(out.len());
         self.control(avail, out.len());
 
         // Crossfade remainder from a latency correction goes first.
@@ -359,8 +413,19 @@ impl RenderSide {
             if self.count_underruns {
                 self.shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
-            self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + self.adapt_max);
-            self.clean = 0;
+            if self.played >= GRACE {
+                if self.since_underrun < RELAX_AFTER {
+                    self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + self.adapt_max);
+                }
+                self.since_underrun = 0;
+                self.clean = 0;
+                // The block that ran us dry gets `prefill` on top when playback resumes, and
+                // counts as a floor at the target, so that position is kept while such blocks
+                // may recur.
+                self.hold = self.prefill;
+                self.floors[0] = self.prefill;
+                self.floors_len = 1;
+            }
             if n > 0 {
                 self.last = out[n - 1];
             }
@@ -382,7 +447,8 @@ impl RenderSide {
         }
     }
 
-    /// Track the FIFO floor; once per window, skip any persistent excess above the target.
+    /// Track the FIFO floor; once per window, skip what stayed above the target for as long as
+    /// the controller remembers.
     fn control(&mut self, avail: usize, period: usize) {
         self.clean += period;
         if self.clean >= RELAX_AFTER {
@@ -394,9 +460,15 @@ impl RenderSide {
         if self.window_pos < CONTROL_WINDOW {
             return;
         }
-        let floor = self.window_min;
+        if self.floors_len == FLOOR_MEMORY {
+            self.floors.copy_within(1.., 0);
+            self.floors_len -= 1;
+        }
+        self.floors[self.floors_len] = self.window_min;
+        self.floors_len += 1;
         self.window_min = usize::MAX;
         self.window_pos = 0;
+        let floor = self.floors[..self.floors_len].iter().copied().min().unwrap_or(0);
         if floor <= self.prefill + CONTROL_SLACK || self.pending_pos < self.pending_len {
             return;
         }
@@ -415,6 +487,8 @@ impl RenderSide {
         }
         self.pending_len = FADE;
         self.pending_pos = 0;
+        // Everything remembered sits `excess` lower from here on.
+        self.floors[..self.floors_len].iter_mut().for_each(|f| *f -= excess);
     }
 
     fn decay_last(&mut self, out: &mut [f32]) {
@@ -478,6 +552,15 @@ impl DspThread {
         for v in buf.iter_mut() {
             self.mute_gain += (target_mute - self.mute_gain).clamp(-step, step);
             *v *= g * self.mute_gain;
+        }
+        if !dry {
+            let level = self.out.buffer().capacity() - self.out.slots();
+            let wait = &self.shared.fifo_wait;
+            let ema = match wait.load(Ordering::Relaxed) {
+                0 => level,
+                prev => (prev * 15 + level) / 16,
+            };
+            wait.store(ema, Ordering::Relaxed);
         }
         push_slice(&mut self.out, buf);
         if let Some(m) = &mut self.mon {
@@ -569,6 +652,7 @@ impl DspThread {
                     continue; // stale block from a previous layout
                 }
                 if !self.primed {
+                    self.shared.fifo_wait.store(0, Ordering::Relaxed);
                     // Lead with a jitter cushion of silence so the next block arrives in time.
                     let zeros = vec![0.0; self.jitter];
                     push_slice(&mut self.out, &zeros);
@@ -668,7 +752,9 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         shared: shared.clone(),
         fx: in_live,
         vad: VadTracker::new(),
-        work: vec![0.0; CAPTURE_MAX_CHUNK],
+        work: vec![0.0; FRAME],
+        work_fill: 0,
+        work_qpc: 0,
         player,
         rec: dry_rec,
         injector: Injector::default(),
@@ -795,6 +881,14 @@ impl Pipeline {
         Ok(Self { capture: Some(capture_stream), render: Some(render_stream), monitor: monitor_stream, dsp: Some(dsp), cmds, shared, info })
     }
 
+    /// What waits in the output device's buffer in front of a sample handed over now, in ms
+    /// (`None` until the device has run). Measured, because it depends on the driver: one period
+    /// where the device wakes us after taking its audio, two where it wakes us before.
+    pub fn output_queue_ms(&self) -> Option<f32> {
+        let frames = self.render.as_ref()?.queued_frames();
+        (frames > 0).then(|| frames as f32 * 1000.0 / RATE as f32)
+    }
+
     pub fn stop(&mut self) {
         if let Some(c) = self.capture.take() {
             c.stop();
@@ -835,33 +929,158 @@ mod tests {
         }
     }
 
+    /// Everything the capture side sent to the engine so far, as one stream.
+    fn drain(t: &Transport) -> Vec<f32> {
+        let mut all = Vec::new();
+        let mut buf = vec![0.0; Transport::IN_SLOT];
+        while let Some(h) = t.ring_in.pop(&mut buf) {
+            all.extend_from_slice(&buf[..h.n]);
+        }
+        all
+    }
+
     #[test]
-    fn jitter_target_adapts_to_underruns_and_relaxes() {
+    fn capture_runs_in_whole_frames_whatever_the_packet_size() {
+        // Noise suppression in a chain costs one frame only when the chain gets whole frames.
+        // Devices do not all deliver 480-sample packets (low-latency mode: 128), so the capture
+        // side re-frames. The engine must receive the same audio either way.
+        let layout = Layout { model_sr: 48_000, block_in: 960, block_out: 2880, out_len: 3840, crossfade: 480, search: 480, nominal_offset: 240 };
+        let x: Vec<f32> = (0..48_000).map(|i| 0.3 * (i as f32 * 0.02).sin() + 0.1 * (i as f32 * 0.31).sin()).collect();
+        let mut sent = Vec::new();
+        for (k, sizes) in [vec![480usize], vec![128], vec![441, 7, 1000, 333]].into_iter().enumerate() {
+            let shared = Arc::new(Shared::default());
+            let fx = serde_json::from_value(serde_json::json!({
+                "input": {"slots": [{"id": 1, "kind": "denoise", "params": {"amount": 0.0}}]}
+            }))
+            .unwrap();
+            shared.fx.update(fx).unwrap();
+            let transport = Arc::new(Transport::create(&format!("Local\\resona-frames-{}-{k}", std::process::id())).unwrap());
+            let parts = build(transport.clone(), shared.clone(), layout, 10.0, false);
+            let mut cap = parts.capture;
+            let mut i = 0;
+            for n in sizes.iter().cycle() {
+                if i + n > x.len() {
+                    break;
+                }
+                cap.process(&x[i..i + n]);
+                i += n;
+            }
+            assert_eq!(shared.fx.input_latency.load(Ordering::Relaxed), 480, "one frame, with {sizes:?} packets");
+            sent.push(drain(&transport));
+            shared.stop.store(true, Ordering::Release);
+            parts.dsp.join().unwrap();
+        }
+        assert!(sent[0].len() >= 15 * 960, "blocks reached the engine");
+        for other in &sent[1..] {
+            let n = other.len().min(sent[0].len());
+            assert!(n >= 14 * 960);
+            assert_eq!(&other[..n], &sent[0][..n], "same audio for every packet size");
+        }
+    }
+
+    /// Play `secs` of 60 ms blocks through a render side in 10 ms device periods. Block k is
+    /// due at k * 60 ms and arrives `late(k)` ms after that. Returns the underruns counted in
+    /// each second and the lowest FIFO level seen in each second (samples).
+    fn play(r: &mut RenderSide, tx: &mut rtrb::Producer<f32>, shared: &Shared, secs: usize, late: impl Fn(usize) -> usize) -> (Vec<u64>, Vec<usize>) {
+        let mut out = [0.0f32; 480];
+        let (mut per_sec, mut floors) = (Vec::new(), Vec::new());
+        let mut next = 0usize;
+        for sec in 0..secs {
+            let before = shared.underruns.load(Ordering::Relaxed);
+            let mut floor = usize::MAX;
+            for tick in sec * 100..(sec + 1) * 100 {
+                while next * 60 + late(next) <= tick * 10 {
+                    feed(tx, 2880);
+                    next += 1;
+                }
+                floor = floor.min(tx.buffer().capacity() - tx.slots());
+                r.process(&mut out);
+            }
+            per_sec.push(shared.underruns.load(Ordering::Relaxed) - before);
+            floors.push(floor);
+        }
+        (per_sec, floors)
+    }
+
+    #[test]
+    fn a_gpu_spike_every_few_seconds_drops_out_once_not_every_time() {
+        // A game sharing the GPU: most blocks take 10 ms, one in fifty (every 3 s) takes 50.
+        let shared = Arc::new(Shared::default());
+        let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
+        let base = 10 * RATE / 1000;
+        let mut r = RenderSide::new(rx, base, ADAPT_MAX.max(2880), None, shared.clone(), true);
+        feed(&mut tx, base); // the DSP thread's start-up cushion
+        let spiky = |k: usize| if k % 50 == 49 { 50 } else { 10 };
+        let (drops, _) = play(&mut r, &mut tx, &shared, 60, spiky);
+        // The first spike is a surprise. After it the buffer must remember how late a block can
+        // be for longer than the spikes are apart, instead of trimming back within a second
+        // and running dry at each of the 19 that follow.
+        assert!(drops.iter().sum::<u64>() <= 2, "dropouts per second: {drops:?}");
+        assert_eq!(drops[10..].iter().sum::<u64>(), 0, "still dropping out after settling: {drops:?}");
+    }
+
+    #[test]
+    fn latency_comes_back_soon_after_the_spikes_stop() {
+        let shared = Arc::new(Shared::default());
+        let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
+        let base = 10 * RATE / 1000;
+        let mut r = RenderSide::new(rx, base, ADAPT_MAX.max(2880), None, shared.clone(), true);
+        feed(&mut tx, base);
+        // 20 s of spikes (blocks 0..333), then calm.
+        let late = |k: usize| if k < 333 && k % 50 == 49 { 50 } else { 10 };
+        let (_, floors) = play(&mut r, &mut tx, &shared, 50, late);
+        let during = floors[15];
+        let after = *floors[40..].iter().max().unwrap();
+        assert!(during >= base + 30 * RATE / 1000, "holds headroom for the next spike while they come: {during}");
+        // Calm again: within 20 s the buffer is back at its configured minimum (it used to take
+        // 20 s to start and then 3 s per ms).
+        assert!(after <= base + CONTROL_SLACK + 480, "floor {after} samples 20 s after the last spike");
+        assert_eq!(r.prefill, base);
+    }
+
+    #[test]
+    fn jitter_target_adapts_to_repeated_underruns_and_relaxes() {
         let shared = Arc::new(Shared::default());
         let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
         let base = 10 * RATE / 1000;
         let mut r = RenderSide::new(rx, base, ADAPT_MAX, None, shared.clone(), true);
         let mut out = [0.0f32; 480];
-        feed(&mut tx, base + 240);
-        r.process(&mut out);
-        r.process(&mut out); // runs dry → underrun
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
-        assert_eq!(r.prefill, base + ADAPT_UP);
-        // Steady supply for 40 s: the target eases back toward the configured minimum.
-        feed(&mut tx, base + ADAPT_UP);
+        let underruns = || shared.underruns.load(Ordering::Relaxed);
+        let run_dry = |r: &mut RenderSide, tx: &mut rtrb::Producer<f32>| {
+            let mut out = [0.0f32; 480];
+            let before = underruns();
+            feed(tx, r.prefill + 240);
+            while underruns() == before {
+                r.process(&mut out);
+            }
+        };
+        // Start-up: an underrun in the first seconds is refilled and otherwise ignored.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill, r.hold), (1, base, 0));
+        // Steady supply past the grace period.
+        feed(&mut tx, base);
+        for _ in 0..(5 * RATE / 480) {
+            feed(&mut tx, 480);
+            r.process(&mut out);
+        }
+        // A first underrun buys headroom at the current target; it does not raise the target.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill, r.hold), (2, base, base));
+        // Another one soon after means that was not enough: now the target grows.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill), (3, base + ADAPT_UP));
+        // Steady supply for 40 s: the target eases back to the configured minimum.
+        feed(&mut tx, r.prefill);
         for _ in 0..(40 * RATE / 480) {
             feed(&mut tx, 480);
             r.process(&mut out);
         }
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
-        assert_eq!(r.prefill, base);
-        // Repeated underruns never push it past the cap.
-        for i in 0..20u64 {
-            feed(&mut tx, r.prefill);
-            while shared.underruns.load(Ordering::Relaxed) < 2 + i {
-                r.process(&mut out);
-            }
+        assert_eq!((underruns(), r.prefill), (3, base));
+        // Underruns in quick succession never push it past the cap.
+        for _ in 0..20 {
+            run_dry(&mut r, &mut tx);
         }
         assert_eq!(r.prefill, base + ADAPT_MAX);
     }
+
 }

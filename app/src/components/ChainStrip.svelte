@@ -8,14 +8,20 @@
   import DotsThree from "phosphor-svelte/lib/DotsThree";
   import CaretRight from "phosphor-svelte/lib/CaretRight";
   import MusicNotes from "phosphor-svelte/lib/MusicNotes";
+  import Warning from "phosphor-svelte/lib/Warning";
+  import FilePlus from "phosphor-svelte/lib/FilePlus";
+  import FolderOpen from "phosphor-svelte/lib/FolderOpen";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import Fader from "./Fader.svelte";
   import SlotEditor from "./SlotEditor.svelte";
   import { store, type ChainName } from "../lib/store.svelte";
   import { api, type DeviceInfo, type SlotSpec } from "../lib/api";
-  import { formatParam } from "../lib/fxformat";
+  import { filterNameFromKind, formatParam, isFilter } from "../lib/fxformat";
 
   let addMenu = $state<ChainName | null>(null);
+  /** The add menu is asking for a new filter's name. */
+  let naming = $state(false);
+  let newName = $state("");
   let outMenu = $state(false);
   let dragFrom = $state<{ chain: ChainName; index: number } | null>(null);
   let dragOver = $state<{ chain: ChainName; index: number } | null>(null);
@@ -30,7 +36,9 @@
   }
   function summary(slot: SlotSpec): string {
     const k = store.kind(slot.kind);
-    if (!k) return "";
+    if (!k) return isFilter(slot.kind) ? "file missing" : "";
+    if (k.filter?.error) return "file error";
+    if (!k.params.length) return "";
     const v = (key: string) => slot.params[key] ?? k.params.find((p) => p.key === key)?.default ?? 0;
     const f = (key: string) => formatParam(k.params.find((p) => p.key === key)!, v(key));
     switch (slot.kind) {
@@ -63,8 +71,20 @@
     const t = store.fxEditing;
     store.fxEditing = t && "special" in t && t.special === special ? null : { special };
   }
-  function addable(chain: ChainName) {
-    return store.catalog.filter((k) => k.stage === "both" || k.stage === chain);
+  function addable(chain: ChainName, filters: boolean) {
+    return store.catalog.filter((k) => !!k.filter === filters && (k.stage === "both" || k.stage === chain));
+  }
+  function toggleAdd(chain: ChainName) {
+    addMenu = addMenu === chain ? null : chain;
+    naming = false;
+    newName = "";
+  }
+  function createFilter(e: SubmitEvent, chain: ChainName) {
+    e.preventDefault();
+    const name = newName.trim();
+    if (!name) return;
+    addMenu = null;
+    store.newFilter(chain, name);
   }
   function drop(chain: ChainName, index: number) {
     if (dragFrom && dragFrom.chain === chain) store.moveSlot(chain, dragFrom.index, index);
@@ -142,8 +162,10 @@
 {#snippet chips(chain: ChainName)}
   {#each store.chain(chain).slots as slot, i (slot.id)}
     {@const k = store.kind(slot.kind)}
+    {@const name = k?.name ?? (isFilter(slot.kind) ? filterNameFromKind(slot.kind) : slot.kind)}
     <div
       class="chip"
+      class:broken={isFilter(slot.kind) && (!k || !!k.filter?.error)}
       class:off={!slot.enabled}
       class:editing={isEditing(chain, slot.id)}
       class:over={dragOver?.chain === chain && dragOver.index === i && dragFrom?.index !== i}
@@ -162,24 +184,50 @@
       <button
         class="lamp"
         class:on={slot.enabled}
-        aria-label="{slot.enabled ? 'Bypass' : 'Enable'} {k?.name}"
+        aria-label="{slot.enabled ? 'Bypass' : 'Enable'} {name}"
         onclick={() => store.toggleSlot(chain, slot.id)}
       ></button>
       <button class="chip-body" onclick={() => edit(chain, slot.id)} aria-expanded={isEditing(chain, slot.id)}>
-        <span class="nm">{k?.name ?? slot.kind}</span>
+        <span class="nm">{name}</span>
         <span class="sum num">{summary(slot)}</span>
       </button>
     </div>
   {/each}
   <div class="pop-wrap">
-    <button class="add pop-btn" aria-label="Add effect" title="Add effect" aria-expanded={addMenu === chain} onclick={() => (addMenu = addMenu === chain ? null : chain)}>
+    <button class="add pop-btn" aria-label="Add effect" title="Add effect" aria-expanded={addMenu === chain} onclick={() => toggleAdd(chain)}>
       <Plus size={13} weight="bold" />
     </button>
     {#if addMenu === chain}
-      <div class="pop" role="menu" use:place>
-        {#each addable(chain) as k (k.kind)}
-          <button role="menuitem" onclick={() => { store.addSlot(chain, k.kind); addMenu = null; }}>{k.name}</button>
-        {/each}
+      <div class="pop add-menu" role="menu" use:place>
+        <div class="col">
+          <span class="label">Effects</span>
+          {#each addable(chain, false) as k (k.kind)}
+            <button role="menuitem" onclick={() => { store.addSlot(chain, k.kind); addMenu = null; }}>{k.name}</button>
+          {/each}
+        </div>
+        <div class="col filters">
+          <span class="label">Filters</span>
+          {#each addable(chain, true) as k (k.kind)}
+            <button role="menuitem" title={k.filter?.error ?? k.filter?.description} onclick={() => { store.addSlot(chain, k.kind); addMenu = null; }}>
+              <span class="grow">{k.name}</span>
+              {#if k.filter?.error}<Warning size={13} class="warn-ic" aria-label="This file has an error" />{/if}
+            </button>
+          {:else}
+            <p class="none">No filter files yet.</p>
+          {/each}
+          <div class="foot">
+            {#if naming}
+              <form class="new" onsubmit={(e) => createFilter(e, chain)}>
+                <!-- svelte-ignore a11y_autofocus -->
+                <input class="input" aria-label="Name of the new filter" placeholder="Name" maxlength="40" bind:value={newName} autofocus />
+                <button class="btn primary" type="submit" disabled={!newName.trim()}>Create</button>
+              </form>
+            {:else}
+              <button role="menuitem" class="quiet" onclick={() => (naming = true)}><FilePlus size={14} /> New filter</button>
+            {/if}
+            <button role="menuitem" class="quiet" onclick={() => { addMenu = null; store.openFiltersFolder(); }}><FolderOpen size={14} /> Open filters folder</button>
+          </div>
+        </div>
       </div>
     {/if}
   </div>
@@ -364,6 +412,13 @@
   .chip.over {
     box-shadow: -3px 0 0 var(--accent);
   }
+  /* A filter whose file is missing or does not parse: it passes audio through. */
+  .chip.broken {
+    border-color: color-mix(in srgb, var(--warn) 55%, var(--line-strong));
+  }
+  .chip.broken .sum {
+    color: var(--warn);
+  }
   .chip[draggable="true"] {
     cursor: grab;
   }
@@ -483,6 +538,65 @@
   }
   .pop button:disabled {
     color: var(--text-3);
+  }
+  /* Add menu: built-in effects on the left, filter files on the right. */
+  .add-menu {
+    grid-template-columns: auto minmax(190px, auto);
+    padding: 0;
+  }
+  .add-menu .col {
+    display: grid;
+    align-content: start;
+    padding: 5px;
+  }
+  .add-menu .filters {
+    grid-template-rows: auto;
+    border-left: 1px solid var(--line);
+  }
+  .add-menu .label {
+    padding: 6px 10px 5px;
+  }
+  .add-menu .col button[role="menuitem"] {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .add-menu .grow {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .add-menu :global(.warn-ic) {
+    flex: none;
+    color: var(--warn);
+  }
+  .add-menu .none {
+    margin: 0;
+    padding: 6px 10px 8px;
+    color: var(--text-3);
+  }
+  .add-menu .foot {
+    display: grid;
+    align-self: end;
+    margin-top: 5px;
+    padding-top: 5px;
+    border-top: 1px solid var(--line);
+  }
+  .add-menu .quiet {
+    color: var(--text-2);
+  }
+  .add-menu .quiet:hover {
+    color: var(--text);
+  }
+  .add-menu .new {
+    display: flex;
+    gap: 5px;
+    padding: 2px 5px 5px;
+  }
+  .add-menu .new .input {
+    flex: 1;
+    width: 120px;
+    user-select: text;
   }
   .gain {
     display: flex;

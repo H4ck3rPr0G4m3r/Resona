@@ -227,6 +227,40 @@ fn chain_import(path: String) -> CmdResult<resona_dsp::fx::ChainSpec> {
     Ok(chain)
 }
 
+// -- filters ----------------------------------------------------------------------------------
+
+/// Open `path` with whatever Windows opens it with (a file: its editor; a folder: Explorer).
+fn open_path(path: &std::path::Path) -> CmdResult<()> {
+    std::process::Command::new("explorer").arg(path).spawn().map(|_| ()).map_err(err)
+}
+
+/// Create a filter from the starter template in the user's folder and open it for editing.
+/// Returns the kind it will have in the catalog once the watcher has read it.
+#[tauri::command]
+fn filter_new(st: State<'_, AppState>, name: String) -> CmdResult<String> {
+    let path = st.rt.filter_new(&name).map_err(err)?;
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    open_path(&path)?;
+    Ok(resona_dsp::fx::composite::kind_for(&stem))
+}
+
+/// Open a filter's file in its editor. A built-in filter is first copied to the user's folder
+/// (the copy replaces it), so what ships with the app is never edited.
+#[tauri::command]
+fn filter_edit(st: State<'_, AppState>, kind: String) -> CmdResult<String> {
+    let path = st.rt.filter_file(&kind).map_err(err)?;
+    open_path(&path)?;
+    Ok(path.display().to_string())
+}
+
+/// Show the user's filter folder in Explorer.
+#[tauri::command]
+fn filters_folder(st: State<'_, AppState>) -> CmdResult<()> {
+    let dir = st.rt.filters_dir().ok_or("no filter folder")?;
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    open_path(&dir)
+}
+
 // -- shell ------------------------------------------------------------------------------------
 
 // -- sound-file input, A/B recorder, latency self-test ------------------------------------------
@@ -359,6 +393,7 @@ pub fn run() {
             let handle = app.handle().clone();
             let stub = std::env::var("RESONA_STUB").is_ok();
             let rt = Runtime::new(move |ev| forward(&handle, ev), stub)?;
+            rt.watch_filters(Some(store::data_root().join("filters")));
             app.manage(AppState { rt, shell: shell::Shell::default(), launched_minimized: minimized });
             shell::build_tray(app.handle())?;
             if minimized {
@@ -409,6 +444,9 @@ pub fn run() {
             fx_param,
             chain_export,
             chain_import,
+            filter_new,
+            filter_edit,
+            filters_folder,
             player_load,
             player_unload,
             player_control,

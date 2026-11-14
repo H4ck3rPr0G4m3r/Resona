@@ -31,6 +31,13 @@ class ContentVec(nn.Module):
         if missing or unexpected:
             raise RuntimeError(f"ContentVec weights mismatch: missing={missing} unexpected={unexpected}")
         model.eval()
+        # The positional convolution carries weight norm as a parametrization, which recomputes
+        # its 4.7 M-element weight on every forward. Bake it in: same weight, no per-block work.
+        pos_conv = model.encoder.pos_conv_embed.conv
+        if nn.utils.parametrize.is_parametrized(pos_conv, "weight"):
+            nn.utils.parametrize.remove_parametrizations(pos_conv, "weight", leave_parametrized=True)
+        elif hasattr(pos_conv, "weight_g"):  # older transformers: classic weight norm
+            nn.utils.remove_weight_norm(pos_conv)
         self.model = model.to(device)
         self.half_precision = half
         if half:

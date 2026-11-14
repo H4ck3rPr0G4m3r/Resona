@@ -1,7 +1,7 @@
 # Resona — Design Spec
 
 **Date:** 2026-10-24
-**Status:** Implemented through M5 (see the implementation plan); M6 (user-definable filters) deferred.
+**Status:** Implemented through M6 (see the implementation plan).
 **Author:** Peter (nagy.peter.zalan@gmail.com), with Claude
 
 Resona is a real-time GPU voice changer for RVC models. It is a clean-room competitor to

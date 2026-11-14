@@ -9,3 +9,4 @@ serde_json = { workspace = true }
 parking_lot = { workspace = true }
 rtrb = { workspace = true }
 nnnoiseless = { version = "0.5", default-features = false }
+toml = { version = "0.8", features = ["preserve_order"] }

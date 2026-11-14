@@ -162,12 +162,29 @@ export interface ParamSpec {
   scale: ParamScale;
 }
 
+/** What only a filter (an effect loaded from a TOML file) has in its catalog entry. */
+export interface FilterMeta {
+  file: string;
+  /** Ships with the app; editing it edits a copy in the user's folder. */
+  builtin: boolean;
+  /** Why the file could not be used. The filter passes audio through while this is set. */
+  error: string | null;
+  description: string;
+  /** Stage types, in order. */
+  stages: string[];
+}
+
 export interface KindSpec {
   kind: string;
   name: string;
   stage: "input" | "output" | "both";
+  /** For a filter: its macros. */
   params: ParamSpec[];
+  filter?: FilterMeta;
 }
+
+/** A chain slot holds a filter when its kind starts with this. */
+export const FILTER_PREFIX = "filter:";
 
 export interface SlotSpec {
   id: number;
@@ -225,6 +242,7 @@ export type RuntimeEvent =
   | { type: "pitch"; input: number[]; output: number[] }
   | { type: "progress"; what: string; done: number; total: number }
   | { type: "log"; line: string }
+  | { type: "filters"; catalog: KindSpec[] }
   | ({ type: "take" } & Take);
 
 export const api = {
@@ -266,6 +284,11 @@ export const api = {
     invoke<void>("fx_param", { chain, slot, key, value }),
   chainExport: (path: string, chain: ChainSpec) => invoke<void>("chain_export", { path, chain }),
   chainImport: (path: string) => invoke<ChainSpec>("chain_import", { path }),
+  /** Create a filter file from the template and open it. Resolves to the kind it will have. */
+  filterNew: (name: string) => invoke<string>("filter_new", { name }),
+  /** Open a filter's file in its editor (a built-in one is copied to the user's folder first). */
+  filterEdit: (kind: string) => invoke<string>("filter_edit", { kind }),
+  filtersFolder: () => invoke<void>("filters_folder"),
   playerLoad: (path: string) => invoke<PlayerState>("player_load", { path }),
   playerUnload: () => invoke<void>("player_unload"),
   playerControl: (c: { playing?: boolean; seekS?: number; looping?: boolean }) =>
