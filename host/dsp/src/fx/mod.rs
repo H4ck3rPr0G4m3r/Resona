@@ -8,13 +8,18 @@
 //!   latency instead of two.
 //! * An effect with latency costs none while switched off: it is left out of the signal path,
 //!   and switching it rebuilds the chain like any other structural change.
+//! * Besides the built-in kinds of [`CATALOG`], a slot can hold a composite filter loaded from a
+//!   TOML file ([`composite`]): its kind is `filter:<file>`, its parameters are its macros.
 //! * The audio thread owns a [`LiveChain`]. The control side ([`ChainControl`]) builds new chains
 //!   off the audio thread and hands them over through a lock-free ring; the old chain crossfades
 //!   out and is sent back to be freed on the control side, so the audio thread never allocates.
 
 pub mod biquad;
+pub mod composite;
 mod dynamics;
+pub mod expr;
 mod lofi;
+pub mod prims;
 mod space;
 mod svf;
 mod tone;
@@ -260,9 +265,9 @@ pub fn create(kind: &str) -> Option<Box<dyn Effect>> {
     Some(fx)
 }
 
-/// `create`, for a slot of a chain: chains run in whole frames, so frame-based effects can use
+/// `create`, for use inside a chain: chains run in whole frames, so frame-based effects can use
 /// their low-latency form.
-fn create_in_chain(kind: &str) -> Option<Box<dyn Effect>> {
+fn create_native(kind: &str) -> Option<Box<dyn Effect>> {
     if kind != "denoise" {
         return create(kind);
     }
@@ -272,13 +277,49 @@ fn create_in_chain(kind: &str) -> Option<Box<dyn Effect>> {
     Some(Box::new(fx))
 }
 
+/// The effect for a chain slot: a built-in kind or a composite filter.
+fn create_in_chain(kind: &str) -> Option<Box<dyn Effect>> {
+    if kind.starts_with(composite::PREFIX) {
+        return Some(Box::new(composite::Composite::new(kind)));
+    }
+    create_native(kind)
+}
+
 /// Latency (samples) a slot of this kind adds to a chain while enabled.
 pub fn chain_latency(kind: &str) -> usize {
-    if kind == "denoise" {
-        denoise::LATENCY_FRAMED
-    } else {
-        0
+    match composite::get(kind) {
+        Some(def) => def.stages.iter().map(|s| chain_latency(&s.kind)).sum(),
+        None if kind == "denoise" => denoise::LATENCY_FRAMED,
+        None => 0,
     }
+}
+
+/// What a chain needs to know about one parameter of a slot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamMeta {
+    pub key: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+}
+
+/// The parameters of a slot kind, in index order: a built-in kind's table, or a filter's
+/// macros. A filter whose file is gone has none (it still builds, as a bypass); any other
+/// unknown kind is `None`.
+pub fn params_of(kind: &str) -> Option<Vec<ParamMeta>> {
+    if kind.starts_with(composite::PREFIX) {
+        let def = composite::get(kind);
+        let macros = def.iter().flat_map(|d| d.macros.iter());
+        return Some(macros.map(|m| ParamMeta { key: m.key.clone(), min: m.min, max: m.max, default: m.default }).collect());
+    }
+    Some(spec(kind)?.params.iter().map(|p| ParamMeta { key: p.key.to_string(), min: p.min, max: p.max, default: p.default }).collect())
+}
+
+/// Everything the UI can put in a chain: the built-in kinds, then the loaded filters.
+pub fn catalog_json() -> serde_json::Value {
+    let mut all: Vec<serde_json::Value> = CATALOG.iter().map(|k| serde_json::to_value(k).unwrap_or_default()).collect();
+    all.extend(composite::all().iter().map(|d| d.catalog_entry()));
+    serde_json::Value::Array(all)
 }
 
 pub use dynamics::Limiter;
@@ -326,12 +367,17 @@ impl Chain {
     pub fn build(spec: &ChainSpec) -> Result<Self, String> {
         let mut slots = Vec::with_capacity(spec.slots.len());
         for s in &spec.slots {
-            let ks = self::spec(&s.kind).ok_or_else(|| format!("unknown effect '{}'", s.kind))?;
+            let params = params_of(&s.kind).ok_or_else(|| format!("unknown effect '{}'", s.kind))?;
             let mut fx = create_in_chain(&s.kind).expect("catalog and create agree");
+            // A filter's macros change when its file is edited; values saved for macros it no
+            // longer has are skipped, not an error.
+            let is_filter = s.kind.starts_with(composite::PREFIX);
             for (k, v) in &s.params {
-                let i = ks.params.iter().position(|p| p.key == k).ok_or_else(|| format!("{}: unknown parameter '{k}'", s.kind))?;
-                let ps = &ks.params[i];
-                fx.set(i, v.clamp(ps.min, ps.max));
+                match params.iter().position(|p| p.key == *k) {
+                    Some(i) => fx.set(i, v.clamp(params[i].min, params[i].max)),
+                    None if is_filter => {}
+                    None => return Err(format!("{}: unknown parameter '{k}'", s.kind)),
+                }
             }
             fx.reset();
             let bypass = !s.enabled && fx.latency() > 0;
@@ -517,10 +563,10 @@ impl ChainControl {
             });
         if same_shape {
             for (a, b) in cur.slots.iter().zip(&new.slots) {
-                let ks = spec(&b.kind).ok_or("unknown effect")?;
-                for (i, ps) in ks.params.iter().enumerate() {
-                    let va = a.params.get(ps.key).copied().unwrap_or(ps.default);
-                    let vb = b.params.get(ps.key).copied().unwrap_or(ps.default).clamp(ps.min, ps.max);
+                let params = params_of(&b.kind).ok_or("unknown effect")?;
+                for (i, ps) in params.iter().enumerate() {
+                    let va = a.params.get(&ps.key).copied().unwrap_or(ps.default);
+                    let vb = b.params.get(&ps.key).copied().unwrap_or(ps.default).clamp(ps.min, ps.max);
                     if va != vb {
                         self.send(ChainMsg::Param { id: b.id, idx: i, value: vb });
                     }
@@ -540,11 +586,20 @@ impl ChainControl {
     pub fn set_param(&self, id: u64, key: &str, value: f32) -> Result<(), String> {
         let mut cur = self.spec.lock();
         let slot = cur.slots.iter_mut().find(|s| s.id == id).ok_or("no such slot")?;
-        let ks = spec(&slot.kind).ok_or("unknown effect")?;
-        let idx = ks.params.iter().position(|p| p.key == key).ok_or("unknown parameter")?;
-        let v = value.clamp(ks.params[idx].min, ks.params[idx].max);
+        let params = params_of(&slot.kind).ok_or("unknown effect")?;
+        let idx = params.iter().position(|p| p.key == key).ok_or("unknown parameter")?;
+        let v = value.clamp(params[idx].min, params[idx].max);
         slot.params.insert(key.to_string(), v);
         self.send(ChainMsg::Param { id, idx, value: v });
+        Ok(())
+    }
+
+    /// Build the chain again from its current spec (crossfaded like any structural change).
+    /// For when what a slot's kind means has changed: a filter file was edited.
+    pub fn rebuild(&self) -> Result<(), String> {
+        let cur = self.spec.lock();
+        let chain = Chain::build(&cur)?;
+        self.send(ChainMsg::Swap(Box::new(chain)));
         Ok(())
     }
 }

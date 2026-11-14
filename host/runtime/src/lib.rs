@@ -7,6 +7,7 @@
 //! DeviceLost (audio device error while running) → retry every 2 s → Running
 //! ```
 
+pub mod filters;
 pub mod fx;
 pub mod pipeline;
 pub mod player;
@@ -57,6 +58,8 @@ pub enum Event {
     Log { line: String },
     /// A recording finished because the session stopped.
     Take(recorder::Take),
+    /// The filter files changed: the effect catalog as it is now.
+    Filters { catalog: Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +135,8 @@ struct Inner {
     control: Mutex<()>,
     /// The latency bar's last total, for comparing with the self-test.
     last_estimate_ms: Mutex<Option<f32>>,
+    /// Where filter files are read from, once `watch_filters` has been called.
+    filter_dirs: Mutex<Option<filters::FilterDirs>>,
 }
 
 #[derive(Clone)]
@@ -160,6 +165,7 @@ impl Runtime {
             restarts: Mutex::new(VecDeque::new()),
             control: Mutex::new(()),
             last_estimate_ms: Mutex::new(None),
+            filter_dirs: Mutex::new(None),
         });
         let rt = Self { inner };
         rt.spawn_meter_thread();
@@ -538,9 +544,78 @@ impl Runtime {
 
     // -- effects ----------------------------------------------------------------------------
 
-    /// Effect catalog (kinds, parameter tables) for generating the chain editor.
+    /// Effect catalog (kinds, parameter tables) for generating the chain editor: the built-in
+    /// effects, then the loaded filters.
     pub fn fx_catalog() -> Value {
-        serde_json::to_value(resona_dsp::fx::CATALOG).unwrap_or(Value::Null)
+        resona_dsp::fx::catalog_json()
+    }
+
+    // -- filters ----------------------------------------------------------------------------
+
+    /// Load the filter files (the built-in folder next to the app plus `user_dir`) and keep
+    /// watching them: a saved file is live within half a second, in the chains that use it and
+    /// in the catalog (`Event::Filters`). Calling it again only changes the user folder.
+    pub fn watch_filters(&self, user_dir: Option<std::path::PathBuf>) {
+        let dirs = filters::FilterDirs { builtin: filters::locate_builtin(), user: user_dir };
+        let first = self.inner.filter_dirs.lock().replace(dirs.clone()).is_none();
+        let mut seen = dirs.signature();
+        resona_dsp::fx::composite::install(dirs.scan());
+        self.inner.shared.fx.rebuild();
+        if !first {
+            (self.inner.emit)(Event::Filters { catalog: Self::fx_catalog() });
+            return;
+        }
+        let weak = Arc::downgrade(&self.inner);
+        std::thread::Builder::new()
+            .name("resona-filters".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let Some(inner) = weak.upgrade() else { return };
+                let Some(dirs) = inner.filter_dirs.lock().clone() else { continue };
+                let now = dirs.signature();
+                if now == seen {
+                    continue;
+                }
+                seen = now;
+                resona_dsp::fx::composite::install(dirs.scan());
+                inner.shared.fx.rebuild();
+                (inner.emit)(Event::Filters { catalog: Self::fx_catalog() });
+            })
+            .expect("spawn filter watcher");
+    }
+
+    /// The user's filter folder, if filters are being watched.
+    pub fn filters_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.filter_dirs.lock().as_ref().and_then(|d| d.user.clone())
+    }
+
+    /// Create `<name>.toml` in the user's folder from the starter template. Returns its path.
+    pub fn filter_new(&self, name: &str) -> Result<std::path::PathBuf> {
+        let dir = self.filters_dir().ok_or_else(|| RuntimeError::Other("no filter folder".into()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let path = dir.join(format!("{}.toml", filters::file_stem(name)));
+        if path.exists() {
+            return Err(RuntimeError::Other(format!("{} already exists", path.display())));
+        }
+        std::fs::write(&path, filters::template(name.trim())).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        Ok(path)
+    }
+
+    /// The file to edit for filter `kind`. A built-in filter is first copied to the user's
+    /// folder, where the copy takes its place, so the shipped file stays as it was.
+    pub fn filter_file(&self, kind: &str) -> Result<std::path::PathBuf> {
+        let def = resona_dsp::fx::composite::get(kind).ok_or_else(|| RuntimeError::Other(format!("{kind} is not loaded")))?;
+        let src = std::path::PathBuf::from(&def.file);
+        if !def.builtin {
+            return Ok(src);
+        }
+        let dir = self.filters_dir().ok_or_else(|| RuntimeError::Other("no filter folder".into()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        let dst = dir.join(src.file_name().unwrap_or_default());
+        if !dst.exists() {
+            std::fs::copy(&src, &dst).map_err(|e| RuntimeError::Other(e.to_string()))?;
+        }
+        Ok(dst)
     }
 
     pub fn fx_settings(&self) -> fx::FxSettings {

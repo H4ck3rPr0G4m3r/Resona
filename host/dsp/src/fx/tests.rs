@@ -281,6 +281,94 @@ fn toggling_noise_suppression_live_changes_latency_without_a_click() {
 }
 
 #[test]
+fn a_filter_is_a_chain_slot_and_reloads_in_place() {
+    let v1 = "[macros]\nlevel = { default = 0, min = -24, max = 0, unit = \"dB\" }\n[[chain]]\ntype = \"gain\"\ngain_db = \"level\"";
+    composite::upsert(composite::FilterDef::parse("t_chain", v1));
+    assert_eq!(params_of("filter:t_chain").unwrap(), vec![ParamMeta { key: "level".into(), min: -24.0, max: 0.0, default: 0.0 }]);
+    let spec = ChainSpec {
+        slots: vec![SlotSpec { id: 3, kind: "filter:t_chain".into(), enabled: true, params: [("level".to_string(), -6.0), ("gone".to_string(), 1.0)].into() }],
+    };
+    let (mut live, ctl) = live_chain();
+    ctl.set(spec.clone()).unwrap(); // "gone": a macro an older version of the file had
+    let level = |live: &mut LiveChain| {
+        let mut x = tone(9600, 300.0, 0.2);
+        live.process(&mut x);
+        x[4800..].iter().fold(0.0f32, |m, v| m.max(v.abs())) / 0.2
+    };
+    assert!((level(&mut live) - 0.501).abs() < 0.01, "the saved macro value is applied");
+    ctl.set_param(3, "level", -12.0).unwrap();
+    assert!((level(&mut live) - 0.251).abs() < 0.01, "a macro moves live");
+    assert!(ctl.set_param(3, "gone", 0.0).is_err());
+
+    // The file is edited: same kind, the knob now drives the gain twice as hard.
+    composite::upsert(composite::FilterDef::parse("t_chain", &v1.replace("\"level\"", "\"2 * level\"")));
+    ctl.rebuild().unwrap();
+    assert!((level(&mut live) - 0.063).abs() < 0.01, "the rebuilt chain uses the new file and keeps the knob at -12");
+
+    // The catalog lists it after the built-in kinds, in the shape the editor is generated from.
+    let cat = catalog_json();
+    let entry = cat.as_array().unwrap().iter().find(|k| k["kind"] == "filter:t_chain").expect("in the catalog");
+    assert_eq!(entry["params"][0]["key"], "level");
+    assert_eq!(entry["params"][0]["unit"], "dB");
+    assert_eq!(entry["filter"]["error"], serde_json::Value::Null);
+    assert_eq!(cat[0]["kind"], "gain");
+
+    // A filter that is not loaded still builds (bypass); an unknown built-in kind does not.
+    let missing = ChainSpec { slots: vec![SlotSpec { id: 1, kind: "filter:t_not_there".into(), enabled: true, params: [("x".to_string(), 1.0)].into() }] };
+    assert_eq!(Chain::build(&missing).unwrap().latency(), 0);
+    assert!(Chain::build(&ChainSpec { slots: vec![SlotSpec { id: 1, kind: "nope".into(), ..Default::default() }] }).is_err());
+}
+
+#[test]
+fn every_primitive_is_finite_bounded_and_click_free() {
+    for k in prims::PRIMS {
+        let mut fx = prims::create(k.kind).unwrap();
+        let mut x = tone(48_000, 180.0, 0.4);
+        run(fx.as_mut(), &mut x);
+        assert!(x.iter().all(|v| v.is_finite()), "{}", k.kind);
+        assert!(x.iter().fold(0.0f32, |m, v| m.max(v.abs())) < 4.0, "{} blew up", k.kind);
+        // At their defaults the degraders do nothing audible: a filter starts from a clean slate.
+        if ["downsample", "bitcrush", "saturate", "noise", "crackle", "gain"].contains(&k.kind) {
+            let err = x.iter().zip(tone(48_000, 180.0, 0.4)).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(err < 1e-4, "{} changes the signal at its defaults by {err}", k.kind);
+        }
+        // Sweeping each control across its range must not click (as for the chain effects).
+        for (i, ps) in k.params.iter().enumerate() {
+            if matches!(ps.scale, Scale::Choice(_)) || ["downsample", "bitcrush", "noise", "crackle"].contains(&k.kind) {
+                continue; // these are meant to be rough
+            }
+            if ps.key == "time_ms" {
+                continue; // sweeping a delay time bends the pitch (tape style), which is not a click
+            }
+            let at = |t: f32| match ps.scale {
+                Scale::Log => (ps.min.ln() + (ps.max.ln() - ps.min.ln()) * t).exp(),
+                _ => ps.min + (ps.max - ps.min) * t,
+            };
+            let steady = |v: f32| {
+                let mut fx = prims::create(k.kind).unwrap();
+                fx.set(i, v);
+                fx.reset();
+                let mut x = tone(24_000, 220.0, 0.3);
+                run(fx.as_mut(), &mut x);
+                roughness(&x[12_000..])
+            };
+            let reference = steady(ps.min).max(steady(ps.max)).max(1e-4);
+            let mut fx = prims::create(k.kind).unwrap();
+            fx.set(i, ps.min);
+            fx.reset();
+            let mut warm = tone(24_000, 220.0, 0.3); // 110 whole periods: the sweep continues it
+            run(fx.as_mut(), &mut warm);
+            let mut x = tone(48_000, 220.0, 0.3);
+            for (s, c) in x.chunks_mut(64).enumerate() {
+                fx.set(i, at((s as f32 / 375.0).min(1.0)));
+                fx.process(c);
+            }
+            assert!(roughness(&x) <= reference * 3.0, "{}.{}: sweep roughness {:.4} vs steady {reference:.4}", k.kind, ps.key, roughness(&x));
+        }
+    }
+}
+
+#[test]
 fn eq_band_hits_its_gain() {
     let mut eq = create("eq").unwrap();
     eq.set(6, 6.0); // g3: mid band (default 1.5 kHz)

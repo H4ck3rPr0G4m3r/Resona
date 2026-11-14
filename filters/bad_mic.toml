@@ -1,0 +1,57 @@
+# Bad Mic: a cheap headset on a bad line.
+#
+# This file is the filter. Copy it into %APPDATA%\Resona\filters, rename it and change it:
+# Resona reloads a filter when its file is saved, and the editor's knobs come from [macros].
+# A copy with the same file name replaces this built-in one.
+
+name = "Bad Mic"
+description = "Narrow band, crushed, hissing. Strength degrades the signal, Telephone narrows it, Static adds noise and crackle."
+
+# Knobs, 0 to 1 unless a macro sets min and max.
+[macros]
+strength  = { default = 0.6 }
+telephone = { default = 0.4 }
+static    = { default = 0.2 }
+
+# Stages run top to bottom. A setting is a number or an expression over the macros:
+# + - * / ( ), lerp(a, b, t), clamp(x, lo, hi), min, max, pow, sqrt, exp, ln, abs, db.
+
+[[chain]]
+type = "highpass"
+freq = "lerp(80, 400, telephone)"
+
+[[chain]]
+type = "lowpass"
+freq = "lerp(12000, 3400, telephone)"
+
+[[chain]]
+type = "peak"
+freq = 2500
+gain_db = "6 * strength"
+q = 1.2
+
+[[chain]]
+type = "downsample"
+rate = "lerp(48000, 11025, strength)"
+
+[[chain]]
+type = "bitcrush"
+bits = "lerp(16, 8, strength)"
+
+[[chain]]
+type = "saturate"
+mode = "soft"
+drive = "lerp(1, 4, strength)"
+
+[[chain]]
+type = "compressor"
+threshold_db = -20
+ratio = 4
+
+[[chain]]
+type = "noise"
+level_db = "lerp(-80, -40, static)"
+
+[[chain]]
+type = "crackle"
+rate = "4 * static"
