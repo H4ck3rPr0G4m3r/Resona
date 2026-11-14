@@ -300,8 +300,11 @@ impl CaptureSide {
 ///   is given back ten seconds after the stalls end.
 /// * After an underrun it waits for the target on top of the block that came too late, so an
 ///   equally late block finds the target still buffered.
-/// * The target itself adapts as a backstop: an underrun raises it by `ADAPT_UP` (up to
-///   `adapt_max` above the configured minimum), and after `RELAX_AFTER` without one it eases back.
+/// * The target itself adapts as a backstop: an underrun within `RELAX_AFTER` of the previous
+///   one (that headroom was not enough) raises it by `ADAPT_UP`, up to `adapt_max` above the
+///   configured minimum; after `RELAX_AFTER` without one it eases back.
+/// * The first `GRACE` of a stream teaches it nothing: the engine's first blocks are slow in a
+///   way later ones are not, so an underrun there is only refilled.
 pub struct RenderSide {
     fifo: rtrb::Consumer<f32>,
     starved: bool,
@@ -318,6 +321,9 @@ pub struct RenderSide {
     floors_len: usize,
     /// Samples of silence still to play before resuming after an underrun.
     hold: usize,
+    /// Samples played so far, and since the latest underrun that counted.
+    played: usize,
+    since_underrun: usize,
     scratch: Vec<f32>,
     pending: [f32; FADE],
     pending_len: usize,
@@ -338,6 +344,7 @@ const ADAPT_MAX: usize = 40 * RATE / 1000;
 const ADAPT_DOWN: usize = RATE / 1000;
 const RELAX_AFTER: usize = 10 * RATE; // underrun-free time before easing the target down
 const RELAX_EVERY: usize = RATE;
+const GRACE: usize = 3 * RATE;
 
 impl RenderSide {
     fn new(fifo: rtrb::Consumer<f32>, prefill: usize, adapt_max: usize, gain: Option<Arc<Shared>>, shared: Arc<Shared>, count_underruns: bool) -> Self {
@@ -355,6 +362,8 @@ impl RenderSide {
             floors: [0; FLOOR_MEMORY],
             floors_len: 0,
             hold: 0,
+            played: 0,
+            since_underrun: RELAX_AFTER,
             scratch: vec![0.0; RATE + FADE],
             pending: [0.0; FADE],
             pending_len: 0,
@@ -387,6 +396,8 @@ impl RenderSide {
             self.window_min = usize::MAX;
             self.window_pos = 0;
         }
+        self.played += out.len();
+        self.since_underrun = self.since_underrun.saturating_add(out.len());
         self.control(avail, out.len());
 
         // Crossfade remainder from a latency correction goes first.
@@ -402,13 +413,19 @@ impl RenderSide {
             if self.count_underruns {
                 self.shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
-            self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + self.adapt_max);
-            self.clean = 0;
-            // The block that ran us dry gets `prefill` on top when playback resumes, and counts
-            // as a floor at the target, so that position is kept while such blocks may recur.
-            self.hold = self.prefill;
-            self.floors[0] = self.prefill;
-            self.floors_len = 1;
+            if self.played >= GRACE {
+                if self.since_underrun < RELAX_AFTER {
+                    self.prefill = (self.prefill + ADAPT_UP).min(self.base_prefill + self.adapt_max);
+                }
+                self.since_underrun = 0;
+                self.clean = 0;
+                // The block that ran us dry gets `prefill` on top when playback resumes, and
+                // counts as a floor at the target, so that position is kept while such blocks
+                // may recur.
+                self.hold = self.prefill;
+                self.floors[0] = self.prefill;
+                self.floors_len = 1;
+            }
             if n > 0 {
                 self.last = out[n - 1];
             }
@@ -1022,32 +1039,48 @@ mod tests {
     }
 
     #[test]
-    fn jitter_target_adapts_to_underruns_and_relaxes() {
+    fn jitter_target_adapts_to_repeated_underruns_and_relaxes() {
         let shared = Arc::new(Shared::default());
         let (mut tx, rx) = rtrb::RingBuffer::new(RATE);
         let base = 10 * RATE / 1000;
         let mut r = RenderSide::new(rx, base, ADAPT_MAX, None, shared.clone(), true);
         let mut out = [0.0f32; 480];
-        feed(&mut tx, base + 240);
-        r.process(&mut out);
-        r.process(&mut out); // runs dry → underrun
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
-        assert_eq!(r.prefill, base + ADAPT_UP);
-        // Steady supply for 40 s: the target eases back toward the configured minimum.
-        feed(&mut tx, base + ADAPT_UP);
+        let underruns = || shared.underruns.load(Ordering::Relaxed);
+        let run_dry = |r: &mut RenderSide, tx: &mut rtrb::Producer<f32>| {
+            let mut out = [0.0f32; 480];
+            let before = underruns();
+            feed(tx, r.prefill + 240);
+            while underruns() == before {
+                r.process(&mut out);
+            }
+        };
+        // Start-up: an underrun in the first seconds is refilled and otherwise ignored.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill, r.hold), (1, base, 0));
+        // Steady supply past the grace period.
+        feed(&mut tx, base);
+        for _ in 0..(5 * RATE / 480) {
+            feed(&mut tx, 480);
+            r.process(&mut out);
+        }
+        // A first underrun buys headroom at the current target; it does not raise the target.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill, r.hold), (2, base, base));
+        // Another one soon after means that was not enough: now the target grows.
+        run_dry(&mut r, &mut tx);
+        assert_eq!((underruns(), r.prefill), (3, base + ADAPT_UP));
+        // Steady supply for 40 s: the target eases back to the configured minimum.
+        feed(&mut tx, r.prefill);
         for _ in 0..(40 * RATE / 480) {
             feed(&mut tx, 480);
             r.process(&mut out);
         }
-        assert_eq!(shared.underruns.load(Ordering::Relaxed), 1);
-        assert_eq!(r.prefill, base);
-        // Repeated underruns never push it past the cap.
-        for i in 0..20u64 {
-            feed(&mut tx, r.prefill);
-            while shared.underruns.load(Ordering::Relaxed) < 2 + i {
-                r.process(&mut out);
-            }
+        assert_eq!((underruns(), r.prefill), (3, base));
+        // Underruns in quick succession never push it past the cap.
+        for _ in 0..20 {
+            run_dry(&mut r, &mut tx);
         }
         assert_eq!(r.prefill, base + ADAPT_MAX);
     }
+
 }
