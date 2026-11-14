@@ -253,9 +253,12 @@ impl Runtime {
                 .unwrap_or((10.0, 10.0));
             let fifo_ms = s.fifo_samples.load(Ordering::Relaxed) as f32 / 48.0;
             let fx_ms = (s.fx.input_latency.load(Ordering::Relaxed) + s.fx.output_latency.load(Ordering::Relaxed)) as f32 / 48.0;
-            let jitter_ms = match s.jitter_samples.load(Ordering::Relaxed) {
-                0 => sess.cfg.jitter_ms,
-                n => n as f32 / 48.0,
+            // What a block really waits in the output FIFO: the jitter target plus whatever
+            // headroom the latest blocks of the last seconds made the controller keep.
+            let jitter_ms = match (s.fifo_wait.load(Ordering::Relaxed), s.jitter_samples.load(Ordering::Relaxed)) {
+                (0, 0) => sess.cfg.jitter_ms,
+                (0, target) => target as f32 / 48.0,
+                (wait, _) => wait as f32 / 48.0,
             };
             let total_ms = input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms;
             *self.inner.last_estimate_ms.lock() = Some(total_ms);
