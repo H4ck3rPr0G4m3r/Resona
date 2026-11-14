@@ -42,6 +42,26 @@ if (params.has("sharedindex")) {
   }
 }
 
+const macro = (key: string, name: string, def: number) => ({ key, name, min: 0, max: 1, default: def, unit: "", scale: "linear" });
+const filters = [
+  {
+    kind: "filter:bad_mic", name: "Bad Mic", stage: "both",
+    params: [macro("strength", "Strength", 0.6), macro("telephone", "Telephone", 0.4), macro("static", "Static", 0.2)],
+    filter: {
+      file: "C:/Resona/filters/bad_mic.toml", builtin: true, error: null,
+      description: "Narrow band, crushed, hissing. Strength degrades the signal, Telephone narrows it, Static adds noise and crackle.",
+      stages: ["highpass", "lowpass", "peak", "downsample", "bitcrush", "saturate", "compressor", "noise", "crackle"],
+    },
+  },
+  {
+    kind: "filter:walkie", name: "Walkie", stage: "both", params: [],
+    filter: {
+      file: "C:/Users/me/AppData/Roaming/Resona/filters/walkie.toml", builtin: false,
+      error: "stage 3 (peak): gain_db: unknown name 'strenght' (macros: strength, squelch)", description: "", stages: [],
+    },
+  },
+];
+
 const dev = (id: string, name: string, direction: string, is_default = false) => ({
   id, name, direction, is_default, mix_rate: 48000, mix_channels: 2,
 });
@@ -75,7 +95,7 @@ function startLive() {
     emit("resona", {
       type: "stats", processed: Math.round(t * 25), dropped: 0, backlog: 0, p50_ms: 14.6 + Math.random(), p99_ms: 17.2 + Math.random(),
       vram_mb: 707, underruns: under, fifo_ms: 10, sola_ncc: 0.91, gpu_priority: params.get("gpuprio") ?? "high",
-      latency: { input_ms: 10, block_ms: 40, lookahead_ms: 40, compute_ms: 15, buffer_ms: 10, effects_ms: 21.4, output_ms: 11, total_ms: 147.4 },
+      latency: { input_ms: 10, block_ms: 40, lookahead_ms: 40, compute_ms: 9.4, buffer_ms: 14.2, effects_ms: 11.4, output_ms: 10, total_ms: 135 },
       devices: {
         input: { device_name: "Microphone (Shure MV7)", mode: "shared", latency_ms: 10 },
         output: { device_name: "Line 1 (Virtual Audio Cable)", mode: "shared", latency_ms: 10 },
@@ -103,8 +123,18 @@ export function install() {
       const a = (args ?? {}) as Record<string, unknown>;
       switch (cmd) {
         case "list_devices": return devices;
-        case "fx_catalog": return catalog;
-        case "fx_set": case "fx_param": return null;
+        case "fx_catalog": return [...catalog, ...filters];
+        case "fx_set": case "fx_param": case "filters_folder": return null;
+        case "filter_edit": return String(a.kind);
+        case "filter_new": {
+          const kind = `filter:${String(a.name).trim().toLowerCase().replace(/[^a-z0-9-]+/g, "_")}`;
+          filters.push({
+            kind, name: String(a.name).trim(), stage: "both", params: [macro("amount", "Amount", 0.5)],
+            filter: { file: `C:/Users/me/AppData/Roaming/Resona/filters/${kind.slice(7)}.toml`, builtin: false, error: null, description: "", stages: ["highpass", "lowpass", "saturate"] },
+          });
+          setTimeout(() => emit("resona", { type: "filters", catalog: [...catalog, ...filters] }), 400);
+          return kind;
+        }
         case "get_status": return { state, message: null, engine_dir: "C:/Resona/engine" };
         case "settings_load":
           return {
@@ -119,6 +149,11 @@ export function install() {
                 { id: 4, kind: "eq", enabled: true, params: { f1: 120, g1: 3, f2: 400, g2: -2.5, q2: 1.2, f3: 1800, g3: 0, q3: 1, f4: 4500, g4: 4, q4: 1.4, f5: 11000, g5: 2 } },
                 { id: 5, kind: "compressor", enabled: true, params: {} },
                 { id: 6, kind: "reverb", enabled: false, params: {} },
+                { id: 7, kind: "filter:bad_mic", enabled: true, params: { strength: 0.6, telephone: 0.4, static: 0.2 } },
+                ...(params.has("brokenfilter") ? [
+                  { id: 8, kind: "filter:walkie", enabled: true, params: {} },
+                  { id: 9, kind: "filter:lost_one", enabled: true, params: {} },
+                ] : []),
               ] },
               gate: { enabled: true, threshold: 0.6, hold_ms: 200, release_ms: 300, range_db: -45 },
               limiter: { enabled: true, ceiling_db: -1 }, singing: false,

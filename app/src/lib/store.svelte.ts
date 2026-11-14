@@ -137,6 +137,10 @@ class Store {
           // The session stopped mid-take; the runtime finished it.
           this.recordingEnded(e);
           break;
+        case "filters":
+          // A filter file was saved, added or removed. The runtime already rebuilt the chains.
+          this.catalog = e.catalog;
+          break;
       }
     });
     api.onImport((p) => (this.importing = p.name === null ? null : p));
@@ -331,6 +335,27 @@ class Store {
 
   replaceChain(name: ChainName, spec: ChainSpec) {
     this.editChain(name, (c) => (c.slots = spec.slots));
+  }
+
+  /** Create a filter file from the template, put it in `chain` and open it for editing. */
+  async newFilter(chain: ChainName, name: string) {
+    try {
+      const kind = await api.filterNew(name);
+      // The catalog entry arrives with the watcher's next pass (within half a second).
+      for (let i = 0; i < 40 && !this.kind(kind); i++) await new Promise((r) => setTimeout(r, 100));
+      if (this.kind(kind)) this.addSlot(chain, kind);
+      else this.notify("error", "The new filter did not load. Check the filters folder.");
+    } catch (e) {
+      this.notify("error", String(e));
+    }
+  }
+
+  editFilter(kind: string) {
+    api.filterEdit(kind).catch((e) => this.notify("error", String(e)));
+  }
+
+  openFiltersFolder() {
+    api.filtersFolder().catch((e) => this.notify("error", String(e)));
   }
 
   // -- voices ---------------------------------------------------------------------------------
