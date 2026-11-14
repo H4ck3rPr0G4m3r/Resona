@@ -3,6 +3,11 @@
 //! * Every effect exposes a static parameter table ([`KindSpec`]); the UI is generated from it.
 //! * Every continuous parameter is smoothed at audio rate (one-pole, ~20 ms), so moving a control
 //!   mid-speech never clicks; enabling/disabling a slot fades over 10 ms.
+//! * A chain is always driven in whole 10 ms frames ([`MAX_CHUNK`] samples, starting on a frame
+//!   boundary). That is what lets a frame-based effect (noise suppression) cost one frame of
+//!   latency instead of two.
+//! * An effect with latency costs none while switched off: it is left out of the signal path,
+//!   and switching it rebuilds the chain like any other structural change.
 //! * The audio thread owns a [`LiveChain`]. The control side ([`ChainControl`]) builds new chains
 //!   off the audio thread and hands them over through a lock-free ring; the old chain crossfades
 //!   out and is sent back to be freed on the control side, so the audio thread never allocates.
@@ -23,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 pub use biquad::SR;
 
-pub const MAX_CHUNK: usize = 512;
+/// Processing granularity of a chain, and the frame its callers must keep to.
+pub const MAX_CHUNK: usize = denoise::FRAME;
 const FADE: usize = 480; // 10 ms enable/disable fade
 const SWAP_FADE: usize = 960; // 20 ms chain swap crossfade
 
@@ -254,6 +260,27 @@ pub fn create(kind: &str) -> Option<Box<dyn Effect>> {
     Some(fx)
 }
 
+/// `create`, for a slot of a chain: chains run in whole frames, so frame-based effects can use
+/// their low-latency form.
+fn create_in_chain(kind: &str) -> Option<Box<dyn Effect>> {
+    if kind != "denoise" {
+        return create(kind);
+    }
+    let mut fx = denoise::Denoise::framed();
+    fx.set(0, spec(kind)?.params[0].default);
+    fx.reset();
+    Some(Box::new(fx))
+}
+
+/// Latency (samples) a slot of this kind adds to a chain while enabled.
+pub fn chain_latency(kind: &str) -> usize {
+    if kind == "denoise" {
+        denoise::LATENCY_FRAMED
+    } else {
+        0
+    }
+}
+
 pub use dynamics::Limiter;
 
 // -- chain ---------------------------------------------------------------------------------------
@@ -283,8 +310,8 @@ struct Slot {
     fx: Box<dyn Effect>,
     mix: Smooth,
     dry: Vec<f32>,
-    delay: Vec<f32>, // dry-path delay line for effects with latency
-    dpos: usize,
+    /// Built switched off and has latency: out of the signal path (see the module docs).
+    bypass: bool,
 }
 
 pub struct Chain {
@@ -300,28 +327,21 @@ impl Chain {
         let mut slots = Vec::with_capacity(spec.slots.len());
         for s in &spec.slots {
             let ks = self::spec(&s.kind).ok_or_else(|| format!("unknown effect '{}'", s.kind))?;
-            let mut fx = create(&s.kind).expect("catalog and create agree");
+            let mut fx = create_in_chain(&s.kind).expect("catalog and create agree");
             for (k, v) in &s.params {
                 let i = ks.params.iter().position(|p| p.key == k).ok_or_else(|| format!("{}: unknown parameter '{k}'", s.kind))?;
                 let ps = &ks.params[i];
                 fx.set(i, v.clamp(ps.min, ps.max));
             }
             fx.reset();
-            let lat = fx.latency();
-            slots.push(Slot {
-                id: s.id,
-                fx,
-                mix: Smooth::new(if s.enabled { 1.0 } else { 0.0 }),
-                dry: vec![0.0; MAX_CHUNK],
-                delay: vec![0.0; lat.max(1)],
-                dpos: 0,
-            });
+            let bypass = !s.enabled && fx.latency() > 0;
+            slots.push(Slot { id: s.id, fx, mix: Smooth::new(if s.enabled { 1.0 } else { 0.0 }), dry: vec![0.0; MAX_CHUNK], bypass });
         }
         Ok(Self { slots })
     }
 
     pub fn latency(&self) -> usize {
-        self.slots.iter().map(|s| s.fx.latency()).sum()
+        self.slots.iter().filter(|s| !s.bypass).map(|s| s.fx.latency()).sum()
     }
 
     pub fn set_param(&mut self, id: u64, idx: usize, v: f32) {
@@ -330,8 +350,10 @@ impl Chain {
         }
     }
 
+    /// Fade a slot in or out in place. Not for effects with latency: switching those changes
+    /// the chain's delay, so [`ChainControl::set`] rebuilds the chain instead.
     pub fn set_enabled(&mut self, id: u64, on: bool) {
-        if let Some(s) = self.slots.iter_mut().find(|s| s.id == id) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.id == id && s.fx.latency() == 0) {
             s.mix.target = if on { 1.0 } else { 0.0 };
         }
     }
@@ -339,7 +361,6 @@ impl Chain {
     pub fn reset(&mut self) {
         for s in &mut self.slots {
             s.fx.reset();
-            s.delay.fill(0.0);
         }
     }
 
@@ -354,29 +375,21 @@ impl Chain {
 
 impl Slot {
     fn process(&mut self, x: &mut [f32]) {
-        let lat = self.fx.latency();
-        let off = self.mix.target == 0.0 && self.mix.cur < 1e-4;
-        if off && lat == 0 {
-            self.mix.cur = 0.0;
-            return; // bypassed and silent-switchable: skip the work entirely
-        }
-        let n = x.len();
-        // Dry copy, delayed by the effect's latency so blending stays aligned.
-        if lat > 0 {
-            for i in 0..n {
-                let d = self.delay[self.dpos];
-                self.delay[self.dpos] = x[i];
-                self.dpos = (self.dpos + 1) % lat;
-                self.dry[i] = d;
-            }
-        } else {
-            self.dry[..n].copy_from_slice(x);
-        }
-        self.fx.process(x);
-        let k = 1.0 / FADE as f32;
-        if self.mix.cur == 1.0 && self.mix.target == 1.0 {
+        if self.bypass {
             return;
         }
+        if self.mix.target == 0.0 && self.mix.cur < 1e-4 {
+            self.mix.cur = 0.0;
+            return; // switched off and faded out: skip the work entirely
+        }
+        if self.mix.cur == 1.0 && self.mix.target == 1.0 {
+            self.fx.process(x);
+            return;
+        }
+        let n = x.len();
+        self.dry[..n].copy_from_slice(x);
+        self.fx.process(x);
+        let k = 1.0 / FADE as f32;
         for i in 0..n {
             let m = &mut self.mix;
             m.cur = if m.target > m.cur { (m.cur + k).min(m.target) } else { (m.cur - k).max(m.target) };
@@ -397,6 +410,9 @@ pub enum ChainMsg {
 pub struct LiveChain {
     cur: Box<Chain>,
     old: Option<Box<Chain>>,
+    /// Samples the new chain still runs unheard before the crossfade: its latency, so what it
+    /// fades in with is audio and not the silence in front of it.
+    warm: usize,
     fade: usize,
     rx: rtrb::Consumer<ChainMsg>,
     trash: rtrb::Producer<Box<Chain>>,
@@ -414,16 +430,21 @@ pub fn live_chain() -> (LiveChain, Arc<ChainControl>) {
     let (tx, rx) = rtrb::RingBuffer::new(256);
     let (ttx, trx) = rtrb::RingBuffer::new(8);
     (
-        LiveChain { cur: Box::new(Chain::empty()), old: None, fade: 0, rx, trash: ttx, tmp: vec![0.0; MAX_CHUNK] },
+        LiveChain { cur: Box::new(Chain::empty()), old: None, warm: 0, fade: 0, rx, trash: ttx, tmp: vec![0.0; MAX_CHUNK] },
         Arc::new(ChainControl { tx: Mutex::new(tx), trash: Mutex::new(trx), spec: Mutex::new(ChainSpec::default()) }),
     )
 }
 
 impl LiveChain {
+    /// Delay of what is leaving right now.
     pub fn latency(&self) -> usize {
-        self.cur.latency()
+        match &self.old {
+            Some(old) if self.warm > 0 => old.latency(),
+            _ => self.cur.latency(),
+        }
     }
 
+    /// `buf`: whole frames ([`MAX_CHUNK`] samples each), as for every chain.
     pub fn process(&mut self, buf: &mut [f32]) {
         while let Ok(msg) = self.rx.pop() {
             match msg {
@@ -432,6 +453,7 @@ impl LiveChain {
                     if let Some(o) = self.old.replace(prev) {
                         let _ = self.trash.push(o); // a still-fading chain is dropped by the control side
                     }
+                    self.warm = self.cur.latency();
                     self.fade = SWAP_FADE;
                 }
                 ChainMsg::Param { id, idx, value } => self.cur.set_param(id, idx, value),
@@ -453,6 +475,11 @@ impl LiveChain {
             old.process(tmp);
             self.cur.process(chunk);
             for i in 0..n {
+                if self.warm > 0 {
+                    self.warm -= 1;
+                    chunk[i] = tmp[i];
+                    continue;
+                }
                 let w = self.fade as f32 / SWAP_FADE as f32;
                 chunk[i] = chunk[i] * (1.0 - w) + tmp[i] * w;
                 self.fade = self.fade.saturating_sub(1);
@@ -480,11 +507,14 @@ impl ChainControl {
     }
 
     /// Replace the whole chain. Structural changes rebuild (with a 20 ms crossfade); a spec that
-    /// only differs in parameter values or enable flags is patched in place instead.
+    /// only differs in parameter values or enable flags is patched in place instead. Switching an
+    /// effect that has latency counts as structural: it moves the whole chain in time.
     pub fn set(&self, new: ChainSpec) -> Result<(), String> {
         let mut cur = self.spec.lock();
         let same_shape = cur.slots.len() == new.slots.len()
-            && cur.slots.iter().zip(&new.slots).all(|(a, b)| a.id == b.id && a.kind == b.kind);
+            && cur.slots.iter().zip(&new.slots).all(|(a, b)| {
+                a.id == b.id && a.kind == b.kind && (a.enabled == b.enabled || chain_latency(&b.kind) == 0)
+            });
         if same_shape {
             for (a, b) in cur.slots.iter().zip(&new.slots) {
                 let ks = spec(&b.kind).ok_or("unknown effect")?;

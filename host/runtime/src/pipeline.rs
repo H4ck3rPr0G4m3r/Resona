@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 pub const RATE: usize = 48_000;
 const FADE: usize = 240; // 5 ms at 48 kHz
 const CAPTURE_MAX_CHUNK: usize = 4096;
+/// Frame the capture side works in (10 ms).
+const FRAME: usize = resona_dsp::fx::MAX_CHUNK;
 const CAPTURE_TAPS: usize = 64;
 
 /// Engine stream layout (mirrors the Python `StreamLayout`).
@@ -201,7 +203,13 @@ pub struct CaptureSide {
     shared: Arc<Shared>,
     fx: LiveChain,
     vad: VadTracker,
+    /// The 10 ms frame being collected. Everything from here on runs on whole frames, whatever
+    /// packet size the device delivers: effect chains need that (see `resona_dsp::fx`), and an
+    /// engine block is a whole number of frames, so no sample waits longer for it.
     work: Vec<f32>,
+    work_fill: usize,
+    /// Capture time of `work[0]` (100 ns QPC units, 0 = unknown).
+    work_qpc: u64,
     player: PlayerSide,
     rec: DrySide,
     injector: Injector,
@@ -217,23 +225,35 @@ impl CaptureSide {
     /// `qpc`: capture time of `x[0]` in 100 ns QPC units (0 = unknown).
     pub fn process_timed(&mut self, x: &[f32], qpc: u64) {
         const HNS: f64 = 1e7 / RATE as f64;
-        for (k, raw) in x.chunks(CAPTURE_MAX_CHUNK).enumerate() {
-            let n = raw.len();
-            let sh = &*self.shared;
-            let w = &mut self.work[..n];
-            w.copy_from_slice(raw);
-            self.player.process(&sh.player, w);
-            let q = if qpc == 0 { 0 } else { qpc + ((k * CAPTURE_MAX_CHUNK) as f64 * HNS) as u64 };
-            self.injector.process(&sh.selftest, w, q);
-            self.vad.feed(w, |p| sh.fx.push_vad(p));
-            self.rec.push(&sh.recorder, self.raw_t, w);
-            self.raw_t += n as u64;
-            self.fx.process(&mut self.work[..n]);
-            self.shared.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
-            let mut buf = std::mem::take(&mut self.work);
-            self.process_chunk(&buf[..n]);
-            std::mem::swap(&mut self.work, &mut buf);
+        let mut i = 0;
+        while i < x.len() {
+            if self.work_fill == 0 {
+                self.work_qpc = if qpc == 0 { 0 } else { qpc + (i as f64 * HNS) as u64 };
+            }
+            let take = (FRAME - self.work_fill).min(x.len() - i);
+            self.work[self.work_fill..self.work_fill + take].copy_from_slice(&x[i..i + take]);
+            self.work_fill += take;
+            i += take;
+            if self.work_fill == FRAME {
+                self.work_fill = 0;
+                self.process_frame();
+            }
         }
+    }
+
+    fn process_frame(&mut self) {
+        let sh = &*self.shared;
+        let w = &mut self.work[..];
+        self.player.process(&sh.player, w);
+        self.injector.process(&sh.selftest, w, self.work_qpc);
+        self.vad.feed(w, |p| sh.fx.push_vad(p));
+        self.rec.push(&sh.recorder, self.raw_t, w);
+        self.raw_t += FRAME as u64;
+        self.fx.process(w);
+        sh.fx.input_latency.store(self.fx.latency(), Ordering::Relaxed);
+        let mut buf = std::mem::take(&mut self.work);
+        self.process_chunk(&buf);
+        std::mem::swap(&mut self.work, &mut buf);
     }
 
     fn process_chunk(&mut self, x: &[f32]) {
@@ -668,7 +688,9 @@ pub fn build(transport: Arc<Transport>, shared: Arc<Shared>, layout: Layout, jit
         shared: shared.clone(),
         fx: in_live,
         vad: VadTracker::new(),
-        work: vec![0.0; CAPTURE_MAX_CHUNK],
+        work: vec![0.0; FRAME],
+        work_fill: 0,
+        work_qpc: 0,
         player,
         rec: dry_rec,
         injector: Injector::default(),
@@ -795,6 +817,14 @@ impl Pipeline {
         Ok(Self { capture: Some(capture_stream), render: Some(render_stream), monitor: monitor_stream, dsp: Some(dsp), cmds, shared, info })
     }
 
+    /// What waits in the output device's buffer in front of a sample handed over now, in ms
+    /// (`None` until the device has run). Measured, because it depends on the driver: one period
+    /// where the device wakes us after taking its audio, two where it wakes us before.
+    pub fn output_queue_ms(&self) -> Option<f32> {
+        let frames = self.render.as_ref()?.queued_frames();
+        (frames > 0).then(|| frames as f32 * 1000.0 / RATE as f32)
+    }
+
     pub fn stop(&mut self) {
         if let Some(c) = self.capture.take() {
             c.stop();
@@ -832,6 +862,55 @@ mod tests {
     fn feed(p: &mut rtrb::Producer<f32>, n: usize) {
         for _ in 0..n {
             p.push(0.1).unwrap();
+        }
+    }
+
+    /// Everything the capture side sent to the engine so far, as one stream.
+    fn drain(t: &Transport) -> Vec<f32> {
+        let mut all = Vec::new();
+        let mut buf = vec![0.0; Transport::IN_SLOT];
+        while let Some(h) = t.ring_in.pop(&mut buf) {
+            all.extend_from_slice(&buf[..h.n]);
+        }
+        all
+    }
+
+    #[test]
+    fn capture_runs_in_whole_frames_whatever_the_packet_size() {
+        // Noise suppression in a chain costs one frame only when the chain gets whole frames.
+        // Devices do not all deliver 480-sample packets (low-latency mode: 128), so the capture
+        // side re-frames. The engine must receive the same audio either way.
+        let layout = Layout { model_sr: 48_000, block_in: 960, block_out: 2880, out_len: 3840, crossfade: 480, search: 480, nominal_offset: 240 };
+        let x: Vec<f32> = (0..48_000).map(|i| 0.3 * (i as f32 * 0.02).sin() + 0.1 * (i as f32 * 0.31).sin()).collect();
+        let mut sent = Vec::new();
+        for (k, sizes) in [vec![480usize], vec![128], vec![441, 7, 1000, 333]].into_iter().enumerate() {
+            let shared = Arc::new(Shared::default());
+            let fx = serde_json::from_value(serde_json::json!({
+                "input": {"slots": [{"id": 1, "kind": "denoise", "params": {"amount": 0.0}}]}
+            }))
+            .unwrap();
+            shared.fx.update(fx).unwrap();
+            let transport = Arc::new(Transport::create(&format!("Local\\resona-frames-{}-{k}", std::process::id())).unwrap());
+            let parts = build(transport.clone(), shared.clone(), layout, 10.0, false);
+            let mut cap = parts.capture;
+            let mut i = 0;
+            for n in sizes.iter().cycle() {
+                if i + n > x.len() {
+                    break;
+                }
+                cap.process(&x[i..i + n]);
+                i += n;
+            }
+            assert_eq!(shared.fx.input_latency.load(Ordering::Relaxed), 480, "one frame, with {sizes:?} packets");
+            sent.push(drain(&transport));
+            shared.stop.store(true, Ordering::Release);
+            parts.dsp.join().unwrap();
+        }
+        assert!(sent[0].len() >= 15 * 960, "blocks reached the engine");
+        for other in &sent[1..] {
+            let n = other.len().min(sent[0].len());
+            assert!(n >= 14 * 960);
+            assert_eq!(&other[..n], &sent[0][..n], "same audio for every packet size");
         }
     }
 

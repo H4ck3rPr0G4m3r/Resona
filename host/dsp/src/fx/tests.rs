@@ -206,6 +206,80 @@ fn denoise_keeps_alignment_and_reduces_noise() {
     assert!(e_out < e_in * 0.25, "noise only reduced to {:.2}", e_out / e_in);
 }
 
+fn denoise_chain(enabled: bool, amount: f32) -> ChainSpec {
+    ChainSpec {
+        slots: vec![
+            SlotSpec { id: 1, kind: "gain".into(), enabled: true, params: Default::default() },
+            SlotSpec { id: 2, kind: "denoise".into(), enabled, params: [("amount".to_string(), amount)].into() },
+        ],
+    }
+}
+
+#[test]
+fn chain_noise_suppression_costs_one_frame_and_nothing_when_bypassed() {
+    // In a chain (always driven in whole 10 ms frames) RNNoise needs one frame, not two.
+    let mut c = Chain::build(&denoise_chain(true, 0.0)).unwrap();
+    assert_eq!(c.latency(), 480);
+    let src = tone(9600, 300.0, 0.3);
+    let mut y = src.clone();
+    for f in y.chunks_mut(480) {
+        c.process(f);
+    }
+    assert!((480..y.len()).all(|i| (y[i] - src[i - 480]).abs() < 1e-6), "amount 0 is the input, one frame late");
+
+    // Bypassed, it must not delay the microphone at all (it used to cost 20 ms switched off).
+    let mut c = Chain::build(&denoise_chain(false, 1.0)).unwrap();
+    assert_eq!(c.latency(), 0);
+    let mut y = src.clone();
+    c.process(&mut y);
+    assert_eq!(y, src);
+}
+
+#[test]
+fn chain_denoised_path_lines_up_with_its_latency() {
+    let mut c = Chain::build(&denoise_chain(true, 1.0)).unwrap();
+    let mut ph = 0.0f32;
+    let voiced: Vec<f32> = (0..48_000)
+        .map(|i| {
+            ph += std::f32::consts::TAU * (140.0 + 30.0 * (i as f32 / 9000.0).sin()) / SR;
+            (1..12).map(|h| (ph * h as f32).sin() / h as f32).sum::<f32>() * 0.1
+        })
+        .collect();
+    let mut y = voiced.clone();
+    c.process(&mut y);
+    let xcorr = |lag: usize| -> f32 { (24_000..47_000).map(|i| y[i] * voiced[i - lag]).sum() };
+    let best = (0..1500).max_by(|&a, &b| xcorr(a).total_cmp(&xcorr(b))).unwrap();
+    assert!(best.abs_diff(480) <= 4, "denoised output lags {best} samples, the chain says 480");
+}
+
+#[test]
+fn toggling_noise_suppression_live_changes_latency_without_a_click() {
+    let (mut live, ctl) = live_chain();
+    ctl.set(denoise_chain(false, 0.0)).unwrap();
+    let src = tone(96_000, 200.0, 0.2);
+    let mut x = src.clone();
+    let frames: Vec<&mut [f32]> = x.chunks_mut(480).collect();
+    let mut lat = Vec::new();
+    for (i, f) in frames.into_iter().enumerate() {
+        match i {
+            50 => ctl.set(denoise_chain(true, 0.0)).unwrap(),
+            120 => ctl.set(denoise_chain(false, 0.0)).unwrap(),
+            _ => {}
+        }
+        live.process(f);
+        lat.push(live.latency());
+    }
+    assert_eq!((lat[49], lat[119], lat[199]), (0, 480, 0), "latency follows the switch");
+    // Amount 0 passes the tone through, so apart from the two crossfades the output is the
+    // input (shifted by the latency while on), and the crossfades themselves must be smooth.
+    assert!(roughness(&x) <= roughness(&tone(9600, 200.0, 0.4)) * 1.5, "switching clicked: {}", roughness(&x));
+    assert!((480 * 100..480 * 110).all(|i| (x[i] - src[i - 480]).abs() < 1e-5), "on: one frame late");
+    assert!((480 * 190..480 * 199).all(|i| (x[i] - src[i]).abs() < 1e-5), "off again: no delay");
+    // No dip to silence while the new chain warms up: the level never collapses mid-tone.
+    let quietest = x[4800..].chunks(240).map(|c| c.iter().fold(0.0f32, |m, v| m.max(v.abs()))).fold(1.0f32, f32::min);
+    assert!(quietest > 0.1, "output dipped to {quietest} during a switch");
+}
+
 #[test]
 fn eq_band_hits_its_gain() {
     let mut eq = create("eq").unwrap();

@@ -246,14 +246,18 @@ impl Runtime {
         if let (Some(obj), Some(sess)) = (engine.as_object_mut(), sess.as_ref()) {
             let lookahead = sess.cfg.stream.get("lookahead_ms").and_then(Value::as_f64).unwrap_or(40.0) as f32;
             let p50 = obj.get("p50_ms").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            let (input_ms, output_ms) = sess.pipeline.as_ref().map(|p| (p.info.input.latency_ms, p.info.output.latency_ms)).unwrap_or((10.0, 10.0));
+            let (input_ms, output_ms) = sess
+                .pipeline
+                .as_ref()
+                .map(|p| (p.info.input.latency_ms, p.output_queue_ms().unwrap_or(p.info.output.latency_ms)))
+                .unwrap_or((10.0, 10.0));
             let fifo_ms = s.fifo_samples.load(Ordering::Relaxed) as f32 / 48.0;
             let fx_ms = (s.fx.input_latency.load(Ordering::Relaxed) + s.fx.output_latency.load(Ordering::Relaxed)) as f32 / 48.0;
             let jitter_ms = match s.jitter_samples.load(Ordering::Relaxed) {
                 0 => sess.cfg.jitter_ms,
                 n => n as f32 / 48.0,
             };
-            let total_ms = input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms + 1.0;
+            let total_ms = input_ms + sess.layout.block_ms() + lookahead + p50 + jitter_ms + fx_ms + output_ms;
             *self.inner.last_estimate_ms.lock() = Some(total_ms);
             let latency = json!({
                 "input_ms": input_ms,
@@ -262,7 +266,7 @@ impl Runtime {
                 "compute_ms": p50,
                 "buffer_ms": jitter_ms,
                 "effects_ms": fx_ms,
-                "output_ms": output_ms + 1.0,
+                "output_ms": output_ms,
                 "total_ms": total_ms,
             });
             obj.insert("latency".into(), latency);
